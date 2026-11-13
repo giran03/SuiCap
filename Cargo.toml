@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/suicap-core", "crates/suicap-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+suicap-core = { path = "crates/suicap-core" }
+thiserror = "2.0"
+bytes = "1.12"
+crossbeam-channel = "0.5"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# bindgen (ffmpeg-sys-next build script) overflows its stack unoptimised once the
+# Tauri crates join the build-dependency graph.
+[profile.dev.build-override]
+opt-level = 2
+
+[profile.release.build-override]
+opt-level = 2

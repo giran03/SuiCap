@@ -1,0 +1,4 @@
+# FFmpeg dev files (headers, import libs, DLLs) live in vendor\ffmpeg.
+# Fetch them with: .scripts\SuiCap Fetch FFmpeg.bat
+[env]
+FFMPEG_DIR = { value = "vendor/ffmpeg", relative = true }

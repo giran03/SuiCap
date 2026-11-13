@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SuiCap",
+  "version": "0.1.0",
+  "identifier": "com.suicap.app",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "bun run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": false,
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "../vendor/ffmpeg/bin/avcodec-63.dll": "avcodec-63.dll",
+      "../vendor/ffmpeg/bin/avformat-63.dll": "avformat-63.dll",
+      "../vendor/ffmpeg/bin/avutil-61.dll": "avutil-61.dll",
+      "../vendor/ffmpeg/bin/swresample-7.dll": "swresample-7.dll"
+    },
+    "publisher": "SuiCap",
+    "shortDescription": "GPU replay buffer and multi-track capture",
+    "windows": {
+      "nsis": {
+        "compression": "lzma",
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      },
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true }
+    }
+  }
+}

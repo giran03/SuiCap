@@ -1,0 +1,9 @@
+.docs/
+/target/
+/vendor/
+/release/
+*.log
+*.tmp
+/node_modules/
+/dist/
+/src-tauri/gen/
