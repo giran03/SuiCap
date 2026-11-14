@@ -4,7 +4,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,6 +22,7 @@ use crate::{
     fault,
     mux::{self, ClipInfo, MuxError, MuxStream, Muxer},
     preprocess::{PreprocessError, Preprocessor},
+    shot, targets,
 };
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
@@ -68,6 +72,8 @@ pub struct VideoOptions {
     pub cursor: bool,
     /// Capture `\\.\DISPLAY<n>` instead of the primary monitor.
     pub display: Option<u32>,
+    /// Record the display, one application's window, or follow the full-screen game.
+    pub source: config::SourceSettings,
     /// Constant-quality level, bounded by the max bitrate (plan §4.3).
     pub quality: u8,
 }
@@ -79,6 +85,7 @@ impl Default for VideoOptions {
             codec: None,
             cursor: true,
             display: None,
+            source: config::SourceSettings::default(),
             quality: 23,
         }
     }
@@ -96,6 +103,7 @@ impl VideoOptions {
             codec: v.codec,
             cursor: s.cursor,
             display: s.display,
+            source: s.source.clone(),
             quality: v.quality,
         }
     }
@@ -109,6 +117,11 @@ pub struct VideoStats {
     pub height: u32,
     pub fps: u32,
     pub source: String,
+    /// What is being recorded now: "display", "window" or "waiting" (held frame).
+    pub capture_kind: &'static str,
+    /// The recorded window's program and title, while `capture_kind` is "window".
+    pub capture_exe: Option<String>,
+    pub capture_title: Option<String>,
     /// Ticks that produced an encoded frame (new or repeated).
     pub frames: u64,
     /// New source frames converted (the rest were CFR repeats).
@@ -147,6 +160,44 @@ fn pick_output(display: Option<u32>) -> Result<(Adapter, Output)> {
     Err(PipelineError::NoOutput)
 }
 
+/// What the GPU that captures `display` can encode, found by opening each hardware encoder.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodecSupport {
+    /// The GPU name, e.g. "NVIDIA GeForce RTX 4070".
+    pub gpu: String,
+    /// Codecs whose encoder opened, best first. Empty when the GPU has none.
+    pub codecs: Vec<Codec>,
+    /// Why nothing is available, when that is the case.
+    pub problem: Option<String>,
+}
+
+/// Probe the encoders of the GPU behind `display` (`None` = the main monitor). Takes a moment
+/// (it opens each encoder once), so callers should cache the answer.
+pub fn codec_support(display: Option<u32>) -> std::result::Result<CodecSupport, String> {
+    capture::com_init();
+    let (adapter, _, _) = pick_output_or_primary(display).map_err(|e| e.to_string())?;
+    let gpu = adapter.name.clone();
+    if matches!(adapter.vendor, capture::Vendor::Other(_)) {
+        return Ok(CodecSupport {
+            gpu,
+            codecs: Vec::new(),
+            problem: Some(
+                "SuiCap records with the GPU's own video encoder, and it supports NVIDIA, AMD and Intel GPUs only."
+                    .into(),
+            ),
+        });
+    }
+    let (device, _) = capture::create_device(&adapter).map_err(|e| e.to_string())?;
+    encode::set_log_quiet(true);
+    let found = crate::probe::probe_encoders(adapter.vendor, &device);
+    encode::set_log_quiet(false);
+    let codecs: Vec<Codec> = found.iter().filter(|e| e.result.is_ok()).map(|e| e.codec).collect();
+    let problem = codecs
+        .is_empty()
+        .then(|| "No video encoder opened on this GPU. Update its graphics driver and try again.".to_string());
+    Ok(CodecSupport { gpu, codecs, problem })
+}
+
 /// Open the first codec that works, in plan order (plan §4.3).
 fn open_encoder(
     adapter: &Adapter,
@@ -155,12 +206,14 @@ fn open_encoder(
     quality: u8,
     frames: &HwFrames,
 ) -> Result<(Encoder, Codec)> {
+    // A pinned codec goes first; if this GPU cannot do it, fall back to the others rather than
+    // failing to record at all (the settings page greys out what the GPU cannot encode).
+    let auto = Codec::PREFERENCE
+        .into_iter()
+        .filter(|c| *c != Codec::H264 || preset.allows_h264());
     let candidates: Vec<Codec> = match pinned {
-        Some(c) => vec![c],
-        None => Codec::PREFERENCE
-            .into_iter()
-            .filter(|c| *c != Codec::H264 || preset.allows_h264())
-            .collect(),
+        Some(c) => std::iter::once(c).chain(auto.filter(|x| *x != c)).collect(),
+        None => auto.collect(),
     };
     let mut errors = Vec::new();
     for codec in candidates {
@@ -216,12 +269,137 @@ impl MemTrace {
     }
 }
 
+/// What the video source is pointed at right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Display,
+    Window { hwnd: isize, exe: String, title: String },
+    /// The chosen app is not there and there is no fallback: the last frame is held.
+    Waiting,
+}
+
+/// What the source setting means right now. `current` keeps an automatic pick on its game
+/// while that window is still there, so glancing at another window does not flip the source.
+fn resolve(src: &config::SourceSettings, current: Option<&Target>) -> Target {
+    use config::SourceKind;
+    let window = |w: targets::WindowInfo| Target::Window {
+        hwnd: w.hwnd,
+        exe: w.exe,
+        title: w.title,
+    };
+    match src.kind {
+        SourceKind::Display => Target::Display,
+        SourceKind::App => match targets::find_window(&src.exe, &src.title) {
+            Some(w) => window(w),
+            None if src.fallback => Target::Display,
+            None => Target::Waiting,
+        },
+        SourceKind::Auto => {
+            if let Some(Target::Window { hwnd, .. }) = current
+                && let Some(w) = targets::list_windows().into_iter().find(|w| w.hwnd == *hwnd)
+            {
+                return window(w);
+            }
+            match targets::foreground_window(true) {
+                Some(w) => window(w),
+                None => Target::Display,
+            }
+        }
+    }
+}
+
+/// Re-resolves the source setting once a second on its own thread (listing windows is too slow
+/// for a video tick); the video thread just reads the latest answer.
+struct Watch {
+    latest: Arc<Mutex<Target>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Watch {
+    fn start(src: config::SourceSettings, initial: Target) -> Self {
+        let latest = Arc::new(Mutex::new(initial));
+        let stop = Arc::new(AtomicBool::new(false));
+        if src.kind != config::SourceKind::Display {
+            let (l, s) = (latest.clone(), stop.clone());
+            let _ = std::thread::Builder::new().name("suicap-source-watch".into()).spawn(move || {
+                while !s.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1000));
+                    let cur = l.lock().map(|g| g.clone()).unwrap_or(Target::Display);
+                    let next = resolve(&src, Some(&cur));
+                    if let Ok(mut g) = l.lock() {
+                        *g = next;
+                    }
+                }
+            });
+        }
+        Self { latest, stop }
+    }
+
+    fn latest(&self) -> Target {
+        self.latest.lock().map(|g| g.clone()).unwrap_or(Target::Display)
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        targets::set_active_app(None);
+    }
+}
+
+/// Fill the stats the UI shows about the source.
+fn describe(stats: &mut VideoStats, active: &Target, src: &config::SourceSettings, display_label: &str) {
+    if !matches!(active, Target::Window { .. }) {
+        targets::set_active_app(None);
+    }
+    match active {
+        Target::Display => {
+            stats.capture_kind = "display";
+            stats.capture_exe = None;
+            stats.capture_title = None;
+            stats.source = display_label.to_owned();
+        }
+        Target::Window { exe, title, .. } => {
+            targets::set_active_app(Some(exe.clone()));
+            stats.capture_kind = "window";
+            stats.capture_exe = Some(exe.clone());
+            stats.capture_title = Some(title.clone());
+            stats.source = format!("WGC window {exe}");
+        }
+        Target::Waiting => {
+            stats.capture_kind = "waiting";
+            stats.capture_exe = Some(src.exe.clone());
+            stats.capture_title = None;
+            stats.source = format!("waiting for {}", src.exe);
+        }
+    }
+}
+
+/// The adapter and output of the monitor a window is on, so the GPU that shows the game also
+/// converts it; the chosen display if that monitor cannot be matched.
+fn pick_output_for_window(hwnd: isize, display: Option<u32>) -> Result<(Adapter, Output, bool)> {
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow},
+    };
+    // SAFETY: a stale handle just yields the nearest monitor.
+    let monitor = unsafe { MonitorFromWindow(HWND(hwnd as *mut _), MONITOR_DEFAULTTONEAREST) };
+    for a in capture::adapters()?.into_iter().filter(|a| !a.software) {
+        if let Some(o) = capture::outputs(&a)?.into_iter().find(|o| o.monitor == monitor) {
+            return Ok((a, o, false));
+        }
+    }
+    pick_output_or_primary(display)
+}
+
 /// Result of a capture-source rebuild on the helper thread.
 enum Reopen {
     /// New source; `true` if it fell back to the primary monitor.
     Ready(WgcSource, bool),
     /// Not possible yet (no monitor, transient error): try again later.
     Retry,
+    /// The window exists but Windows would not let it be captured (e.g. it runs elevated).
+    WindowFailed(isize, String),
     /// Needs a full rebuild (adapter changed) or cannot continue.
     Fatal(PipelineError),
 }
@@ -240,6 +418,15 @@ pub struct VideoPath {
     luid: (u32, i32),
     display: Option<u32>,
     cursor: bool,
+    /// What the user asked to record, the target it resolves to now, and the watcher that
+    /// re-resolves it every second (app starts, closes, goes to the background).
+    source_cfg: config::SourceSettings,
+    active: Target,
+    watch: Watch,
+    /// A window Windows refused to capture; not retried while it stays the same window.
+    bad_window: Option<isize>,
+    /// The stats' source text while the display is recorded.
+    display_label: String,
     pre: Preprocessor,
     encoder: Encoder,
     frames: HwFrames,
@@ -258,7 +445,11 @@ impl VideoPath {
         encode::set_log_quiet(false); // warnings and errors only
         let trace = MemTrace::from_env();
         trace.mark("start");
-        let (adapter, output, fell_back) = pick_output_or_primary(opts.display)?;
+        let first_target = resolve(&opts.source, None);
+        let (adapter, output, fell_back) = match &first_target {
+            Target::Window { hwnd, .. } => pick_output_for_window(*hwnd, opts.display)?,
+            _ => pick_output_or_primary(opts.display)?,
+        };
         let mut preset = opts.preset;
         if preset.width == 0 || preset.height == 0 {
             // Monitor size, rounded down to even (NV12), capped at 8K.
@@ -277,8 +468,22 @@ impl VideoPath {
         let (encoder, codec) = open_encoder(&adapter, preset, opts.codec, opts.quality, &frames)?;
         trace.mark("encoder open");
         let mut pre = Preprocessor::new(&device, &context, preset.width, preset.height, preset.fps)?;
-        let mut src = WgcSource::for_monitor(&device, &output, opts.cursor)?;
         let mut notes = Vec::new();
+        let mut active = first_target.clone();
+        let mut bad_window = None;
+        let mut src = match &first_target {
+            Target::Window { hwnd, exe, .. } => match WgcSource::for_window(&device, *hwnd, opts.cursor) {
+                Ok(s) => s,
+                Err(e) => {
+                    notes.push(format!("Could not record {exe} ({e}); recording the display instead."));
+                    bad_window = Some(*hwnd);
+                    active = Target::Display;
+                    WgcSource::for_monitor(&device, &output, opts.cursor)?
+                }
+            },
+            // Waiting starts on the display for its first frame, then holds it.
+            _ => WgcSource::for_monitor(&device, &output, opts.cursor)?,
+        };
         if fell_back {
             notes.push(format!(
                 "Display {} was not found; recording the main monitor.",
@@ -313,6 +518,9 @@ impl VideoPath {
             notes,
             ..Default::default()
         };
+        let mut stats = stats;
+        let display_label = stats.source.clone();
+        describe(&mut stats, &active, &opts.source, &display_label);
         Ok(Self {
             last,
             src: Some(src),
@@ -322,6 +530,11 @@ impl VideoPath {
             luid: adapter.luid,
             display: opts.display,
             cursor: opts.cursor,
+            watch: Watch::start(opts.source.clone(), active.clone()),
+            source_cfg: opts.source.clone(),
+            active,
+            bad_window,
+            display_label,
             pre,
             encoder,
             frames,
@@ -339,6 +552,15 @@ impl VideoPath {
             height: self.stats.height,
             fps: self.stats.fps,
         }
+    }
+
+    /// Read the newest encoded-size frame back as RGBA (plan rule 1's one exception).
+    pub fn screenshot(&self) -> std::result::Result<shot::Image, String> {
+        let frame = self.last.as_ref().ok_or("no frame captured yet")?;
+        let (tex, slice) = frame.texture();
+        // SAFETY: the device is live; the immediate context is only used on this thread.
+        let ctx = unsafe { self.device.GetImmediateContext() }.map_err(|e| e.to_string())?;
+        shot::read_nv12(&self.device, &ctx, &tex, slice, self.stats.width, self.stats.height).map_err(|e| e.to_string())
     }
 
     pub fn stream_params(&self) -> Result<StreamParams> {
@@ -385,6 +607,7 @@ impl VideoPath {
             ))
             .into());
         }
+        self.follow_target();
         if fault::fire(fault::Kind::AccessLost) && self.src.is_some() {
             let old = self.src.take();
             self.start_reopen(old);
@@ -405,6 +628,18 @@ impl VideoPath {
                         }
                     }
                 }
+                Ok(Reopen::WindowFailed(hwnd, why)) => {
+                    self.reopening = None;
+                    self.bad_window = Some(hwnd);
+                    if let Target::Window { exe, .. } = &self.active {
+                        self.stats
+                            .notes
+                            .push(format!("Could not record {exe} ({why}); recording the display instead."));
+                    }
+                    self.active = Target::Display;
+                    self.start_reopen(None);
+                    return Ok(None);
+                }
                 Ok(Reopen::Retry) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.reopening = None;
                     self.retry_at_us = capture::qpc_now_us() + 500_000;
@@ -413,6 +648,9 @@ impl VideoPath {
                 Ok(Reopen::Fatal(e)) => return Err(e),
                 Err(crossbeam_channel::TryRecvError::Empty) => return Ok(None),
             }
+        }
+        if self.active == Target::Waiting {
+            return Ok(None); // holding the last frame until the app is back
         }
         let Some(src) = self.src.as_mut() else {
             if capture::qpc_now_us() >= self.retry_at_us {
@@ -430,25 +668,69 @@ impl VideoPath {
         }
     }
 
-    /// Drop `old` and build a new source on a helper thread.
+    /// Move the source when what the setting means has changed: the app started or closed,
+    /// or the full-screen game changed.
+    fn follow_target(&mut self) {
+        let mut want = self.watch.latest();
+        if let Target::Window { hwnd, .. } = &want
+            && self.bad_window == Some(*hwnd)
+        {
+            want = if self.source_cfg.fallback { Target::Display } else { Target::Waiting };
+        }
+        if want == self.active {
+            return;
+        }
+        let was_window = matches!(self.active, Target::Window { .. });
+        self.active = want;
+        self.reopening = None; // a rebuild for the old target is no longer wanted
+        let old = self.src.take();
+        self.stats.notes.retain(|n| !n.starts_with("Could not record"));
+        if let Target::Window { hwnd, .. } = &self.active
+            && self.bad_window.is_some_and(|b| b != *hwnd)
+        {
+            self.bad_window = None; // a different window: worth trying
+        }
+        self.describe_active();
+        if self.active == Target::Waiting {
+            drop(old);
+            self.stats.source_restarts += u64::from(was_window);
+        } else {
+            self.start_reopen(old);
+        }
+    }
+
+    fn describe_active(&mut self) {
+        describe(&mut self.stats, &self.active, &self.source_cfg, &self.display_label);
+    }
+
+    /// Drop `old` and build a new source for the active target on a helper thread.
     fn start_reopen(&mut self, old: Option<WgcSource>) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let device = capture::SendDevice(self.device.clone());
         let (display, cursor, luid) = (self.display, self.cursor, self.luid);
+        let target = self.active.clone();
         let spawned = std::thread::Builder::new()
             .name("suicap-wgc-reopen".into())
             .spawn(move || {
                 capture::com_init();
                 drop(old);
-                let result = match pick_output_or_primary(display) {
-                    Ok((adapter, _, _)) if adapter.luid != luid => Reopen::Fatal(PipelineError::AdapterChanged),
-                    Ok((_, output, fell_back)) => match WgcSource::for_monitor(&device.0, &output, cursor) {
-                        Ok(src) => Reopen::Ready(src, fell_back),
-                        Err(e) if e.is_recoverable() || matches!(e, CaptureError::Win(_)) => Reopen::Retry,
-                        Err(e) => Reopen::Fatal(e.into()),
+                let result = match target {
+                    Target::Window { hwnd, .. } => match WgcSource::for_window(&device.0, hwnd, cursor) {
+                        Ok(src) => Reopen::Ready(src, false),
+                        Err(_) if !targets::window_exists(hwnd) => Reopen::Retry,
+                        Err(e) if e.is_recoverable() => Reopen::Retry,
+                        Err(e) => Reopen::WindowFailed(hwnd, e.to_string()),
                     },
-                    Err(PipelineError::NoOutput) => Reopen::Retry, // no monitor at all yet
-                    Err(e) => Reopen::Fatal(e),
+                    _ => match pick_output_or_primary(display) {
+                        Ok((adapter, _, _)) if adapter.luid != luid => Reopen::Fatal(PipelineError::AdapterChanged),
+                        Ok((_, output, fell_back)) => match WgcSource::for_monitor(&device.0, &output, cursor) {
+                            Ok(src) => Reopen::Ready(src, fell_back),
+                            Err(e) if e.is_recoverable() || matches!(e, CaptureError::Win(_)) => Reopen::Retry,
+                            Err(e) => Reopen::Fatal(e.into()),
+                        },
+                        Err(PipelineError::NoOutput) => Reopen::Retry, // no monitor at all yet
+                        Err(e) => Reopen::Fatal(e),
+                    },
                 };
                 let _ = tx.send(result);
             });
@@ -693,6 +975,14 @@ pub struct SessionStatus {
     pub dropped: u64,
     /// Upper bound of buffer RAM at the max bitrate (plan §4.3).
     pub buffer_estimate_mb: u64,
+    pub recording: bool,
+    pub recording_secs: f64,
+    /// What the video source is pointed at now, and the notes about it (these change live).
+    pub capture_kind: &'static str,
+    pub capture_exe: Option<String>,
+    pub capture_title: Option<String>,
+    pub source: String,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -703,6 +993,11 @@ pub enum SessionEvent {
     ClipSaved(ClipInfo),
     /// A save that produced no file (buffer still empty, or the write failed).
     SaveFailed(String),
+    RecordingStarted,
+    RecordingSaved(ClipInfo),
+    RecordingFailed(String),
+    ScreenshotSaved(PathBuf),
+    ScreenshotFailed(String),
     /// The video path failed and is being rebuilt (plan §7); the buffer was cleared.
     Recovering(String),
     /// The session ended: `None` after `stop`, otherwise the fatal error.
@@ -712,6 +1007,9 @@ pub enum SessionEvent {
 enum SessionCmd {
     /// `None` = the whole buffer.
     Save(Option<u32>),
+    RecordStart,
+    RecordStop,
+    Screenshot,
     Stop,
 }
 
@@ -741,6 +1039,23 @@ impl Session {
     /// command queue drops the request (plan rule 3).
     pub fn save(&self, secs: Option<u32>) -> bool {
         self.cmd.try_send(SessionCmd::Save(secs)).is_ok()
+    }
+
+    /// Start continuous recording to disk. Never blocks; a full command queue
+    /// drops the request (plan rule 3).
+    pub fn record_start(&self) -> bool {
+        self.cmd.try_send(SessionCmd::RecordStart).is_ok()
+    }
+
+    /// Stop continuous recording and finalize the file. Never blocks; a full
+    /// command queue drops the request.
+    pub fn record_stop(&self) -> bool {
+        self.cmd.try_send(SessionCmd::RecordStop).is_ok()
+    }
+
+    /// Save the newest frame as a PNG in the clips folder. Never blocks.
+    pub fn screenshot(&self) -> bool {
+        self.cmd.try_send(SessionCmd::Screenshot).is_ok()
     }
 
     pub fn is_running(&self) -> bool {
@@ -785,6 +1100,128 @@ fn clip_path(dir: &Path, ext: &str) -> std::io::Result<PathBuf> {
 const REBUILD_ATTEMPTS: u32 = 6;
 
 type Workers = Vec<std::thread::JoinHandle<mux::Result<ClipInfo>>>;
+type RecWorkers = Vec<(
+    std::thread::JoinHandle<std::result::Result<ClipInfo, String>>,
+    Option<String>,
+)>;
+
+type Shots = Vec<std::thread::JoinHandle<std::result::Result<PathBuf, String>>>;
+
+fn reap_shots(shots: &mut Shots, all: bool, on_event: &dyn Fn(SessionEvent)) {
+    let mut i = 0;
+    while i < shots.len() {
+        if all || shots[i].is_finished() {
+            match shots.swap_remove(i).join() {
+                Ok(Ok(path)) => on_event(SessionEvent::ScreenshotSaved(path)),
+                Ok(Err(e)) => on_event(SessionEvent::ScreenshotFailed(e)),
+                Err(_) => on_event(SessionEvent::ScreenshotFailed("the screenshot worker crashed".into())),
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+const RECORD_QUEUE_CAPACITY: usize = 512;
+
+struct Recorder {
+    tx: crossbeam_channel::Sender<Packet>,
+    thread: std::thread::JoinHandle<std::result::Result<ClipInfo, String>>,
+    started_at: std::time::Instant,
+}
+
+fn spawn_recorder(mkv_path: PathBuf, mp4_path: Option<PathBuf>, streams: Vec<MuxStream>) -> std::io::Result<Recorder> {
+    let (tx, rx) = crossbeam_channel::bounded::<Packet>(RECORD_QUEUE_CAPACITY);
+    let thread = std::thread::Builder::new()
+        .name("suicap-record".into())
+        .spawn(move || {
+            let mut mux = Muxer::create(&mkv_path, &streams).map_err(|e| e.to_string())?;
+            let mut rb = mux::Rebaser::default();
+            let (mut first, mut last) = (None, 0);
+            for p in rx.iter() {
+                if let Some((pts, _)) = rb.apply(&p).filter(|_| p.stream == VIDEO_STREAM) {
+                    first.get_or_insert(pts);
+                    last = last.max(pts);
+                }
+                mux.write(&p).map_err(|e| e.to_string())?;
+            }
+            let packets = mux.packets;
+            if packets == 0 {
+                drop(mux);
+                return Err("no video keyframe received before recording stopped".into());
+            }
+            let mkv = mux.finish().map_err(|e| e.to_string())?;
+            let final_path = match mp4_path {
+                Some(mp4) => {
+                    if let Err(e) = mux::remux_to_mp4(&mkv, &mp4) {
+                        // Keep the .mkv on failure so nothing recorded is lost.
+                        return Err(format!("remux to mp4 failed (kept {}): {e}", mkv.display()));
+                    }
+                    let _ = std::fs::remove_file(&mkv);
+                    mp4
+                }
+                None => mkv,
+            };
+            Ok(ClipInfo {
+                path: final_path,
+                packets,
+                first_pts_us: first.unwrap_or(0),
+                last_pts_us: last,
+            })
+        })?;
+    Ok(Recorder {
+        tx,
+        thread,
+        started_at: std::time::Instant::now(),
+    })
+}
+
+fn stop_recorder(recorder: &mut Option<Recorder>, rec_workers: &mut RecWorkers, err_override: Option<String>) {
+    if let Some(rec) = recorder.take() {
+        drop(rec.tx);
+        rec_workers.push((rec.thread, err_override));
+    }
+}
+
+fn send_record_packet(recorder: &mut Option<Recorder>, rec_workers: &mut RecWorkers, p: Packet) {
+    let Some(rec) = recorder.as_ref() else {
+        return;
+    };
+    match rec.tx.try_send(p) {
+        Ok(()) => {}
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            stop_recorder(
+                recorder,
+                rec_workers,
+                Some("recording writer fell behind; stopped recording".into()),
+            );
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            stop_recorder(recorder, rec_workers, None);
+        }
+    }
+}
+
+fn reap_recordings(workers: &mut RecWorkers, all: bool, on_event: &dyn Fn(SessionEvent)) {
+    let mut i = 0;
+    while i < workers.len() {
+        if all || workers[i].0.is_finished() {
+            let (handle, err_override) = workers.swap_remove(i);
+            let res = handle.join();
+            if let Some(msg) = err_override {
+                on_event(SessionEvent::RecordingFailed(msg));
+            } else {
+                match res {
+                    Ok(Ok(clip)) => on_event(SessionEvent::RecordingSaved(clip)),
+                    Ok(Err(e)) => on_event(SessionEvent::RecordingFailed(e)),
+                    Err(_) => on_event(SessionEvent::RecordingFailed("recording worker panicked".into())),
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
 
 fn reap(workers: &mut Workers, all: bool, on_event: &dyn Fn(SessionEvent)) {
     let mut i = 0;
@@ -807,6 +1244,11 @@ fn audio_notes(opts: &SessionOptions, audio: Option<&AudioPath>) -> Vec<String> 
     if let Some(a) = audio {
         if !a.process_loopback {
             notes.push("Per-app audio tracks are not available here; all desktop sound goes to one track.".into());
+            if opts.audio.as_ref().is_some_and(|o| o.muting) {
+                notes.push(
+                    "Muted apps are still heard: switching apps off needs per-app audio (Windows 10 version 2004 or newer).".into(),
+                );
+            }
         }
         if opts.audio.as_ref().is_some_and(|o| o.mic) && !a.mic_open {
             notes.push("No microphone found; its track stays silent until one is connected.".into());
@@ -842,6 +1284,9 @@ fn run_session(
     on_event(armed_event(&v, &notes));
 
     let mut workers: Workers = Vec::new();
+    let mut rec_workers: RecWorkers = Vec::new();
+    let mut shots: Shots = Vec::new();
+    let mut recorder: Option<Recorder> = None;
     let mut packets = Vec::new();
     let mut video = Some(v);
     let result = 'session: loop {
@@ -854,9 +1299,15 @@ fn run_session(
                 Err(e) => break e,
             };
             for p in packets.drain(..) {
+                if recorder.is_some() {
+                    send_record_packet(&mut recorder, &mut rec_workers, p.clone());
+                }
                 buf.push(p);
             }
             if let Err(e) = drain_audio(audio.as_ref(), |p| {
+                if recorder.is_some() {
+                    send_record_packet(&mut recorder, &mut rec_workers, p.clone());
+                }
                 buf.push(p);
                 Ok(())
             }) {
@@ -875,10 +1326,47 @@ fn run_session(
                         }
                     }
                 }
+                Ok(SessionCmd::RecordStart) => {
+                    if recorder.is_none() {
+                        match clip_path(&opts.clips_dir, "mkv") {
+                            Ok(mkv_path) => {
+                                let mp4_path =
+                                    (opts.container == config::Container::Mp4).then(|| mkv_path.with_extension("mp4"));
+                                match spawn_recorder(mkv_path, mp4_path, streams.clone()) {
+                                    Ok(rec) => {
+                                        recorder = Some(rec);
+                                        on_event(SessionEvent::RecordingStarted);
+                                    }
+                                    Err(e) => {
+                                        on_event(SessionEvent::RecordingFailed(format!("recording thread: {e}")));
+                                    }
+                                }
+                            }
+                            Err(e) => on_event(SessionEvent::RecordingFailed(format!("clips folder: {e}"))),
+                        }
+                    }
+                }
+                Ok(SessionCmd::RecordStop) => {
+                    stop_recorder(&mut recorder, &mut rec_workers, None);
+                }
+                Ok(SessionCmd::Screenshot) => {
+                    let started = clip_path(&opts.clips_dir, "png")
+                        .map_err(|e| format!("clips folder: {e}"))
+                        .and_then(|path| Ok((path, v.screenshot()?)));
+                    match started {
+                        // PNG encoding runs off the video thread.
+                        Ok((path, image)) => shots.push(std::thread::spawn(move || {
+                            shot::write_png(&image, &path).map_err(|e| e.to_string())
+                        })),
+                        Err(e) => on_event(SessionEvent::ScreenshotFailed(e)),
+                    }
+                }
                 Ok(SessionCmd::Stop) | Err(crossbeam_channel::TryRecvError::Disconnected) => break 'session Ok(()),
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
             reap(&mut workers, false, on_event);
+            reap_recordings(&mut rec_workers, false, on_event);
+            reap_shots(&mut shots, false, on_event);
             if index % fps == 0 {
                 let b = buf.stats();
                 on_event(SessionEvent::Status(SessionStatus {
@@ -887,6 +1375,13 @@ fn run_session(
                     frames: v.stats.frames,
                     dropped: v.stats.dropped,
                     buffer_estimate_mb: estimate_mb,
+                    recording: recorder.is_some(),
+                    recording_secs: recorder.as_ref().map_or(0.0, |r| r.started_at.elapsed().as_secs_f64()),
+                    capture_kind: v.stats.capture_kind,
+                    capture_exe: v.stats.capture_exe.clone(),
+                    capture_title: v.stats.capture_title.clone(),
+                    source: v.stats.source.clone(),
+                    notes: v.stats.notes.clone(),
                 }));
             }
         };
@@ -895,6 +1390,7 @@ fn run_session(
         // change), back off between attempts. Audio keeps running; its packets are
         // dropped by the empty buffer until the first new keyframe.
         on_event(SessionEvent::Recovering(failure.to_string()));
+        stop_recorder(&mut recorder, &mut rec_workers, None);
         video = None;
         buf.flush();
         let mut attempt = 0;
@@ -910,10 +1406,20 @@ fn run_session(
                     Ok(SessionCmd::Save(_)) => on_event(SessionEvent::SaveFailed(
                         "capture is restarting; nothing to save yet".into(),
                     )),
+                    Ok(SessionCmd::RecordStart) => on_event(SessionEvent::RecordingFailed(
+                        "capture is restarting; cannot start recording yet".into(),
+                    )),
+                    Ok(SessionCmd::RecordStop) => {}
+                    Ok(SessionCmd::Screenshot) => {
+                        on_event(SessionEvent::ScreenshotFailed(
+                            "capture is restarting; try again".into(),
+                        ));
+                    }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 }
                 let _ = drain_audio(audio.as_ref(), |_| Ok(()));
                 reap(&mut workers, false, on_event);
+                reap_recordings(&mut rec_workers, false, on_event);
             }
             match VideoPath::open(&opts.video) {
                 Ok(new) => break new,
@@ -929,8 +1435,11 @@ fn run_session(
         on_event(armed_event(&v, &notes));
         video = Some(v);
     };
-    // Saves already started still finish (they hold their own packet handles).
+    // Saves and recordings already started still finish (they hold their own packet handles).
+    stop_recorder(&mut recorder, &mut rec_workers, None);
     reap(&mut workers, true, on_event);
+    reap_recordings(&mut rec_workers, true, on_event);
+    reap_shots(&mut shots, true, on_event);
     let finished = video.map(|v| v.finish(&mut packets)).transpose();
     let stopped = stop_audio(audio, |_| Ok(()));
     result?;

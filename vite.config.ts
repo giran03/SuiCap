@@ -6,6 +6,6 @@ export default defineConfig({
   root: "ui",
   plugins: [svelte()],
   clearScreen: false,
-  server: { port: 1420, strictPort: true, watch: { ignored: ["**/src-tauri/**", "**/target/**"] } },
+  server: { port: 1421, strictPort: true, watch: { ignored: ["**/src-tauri/**", "**/target/**"] } },
   build: { outDir: "../dist", emptyOutDir: true, target: "es2022" },
 });

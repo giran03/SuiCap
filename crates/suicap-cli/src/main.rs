@@ -7,7 +7,7 @@ use std::{
 };
 
 use suicap_core::{
-    audio::{AudioOptions, AudioStats, Target},
+    audio::{AudioOptions, AudioStats, Target, TrackKind},
     config::Codec,
     encode::AudioCodec,
     pipeline::{self, RecordOptions, ReplayOptions, VideoOptions, VideoStats},
@@ -18,8 +18,8 @@ const USAGE: &str = "usage:
   suicap-cli record <secs> [out.mkv|out.mp4] [video options]
   suicap-cli replay <buffer_secs> <save_secs> [out.mp4|out.mkv] [video options]
   suicap-cli session <minutes> [clips_dir] [--buffer S] [--save-every M] [options]
-video options: --codec av1|hevc|h264  --fps N  --display N  --no-cursor
-audio options: --no-audio  --no-mic  --game <exe|pid>  --voice <exe|pid>  --media <exe|pid>
+video options: --codec av1|hevc|h264  --fps N  --display N  --no-cursor  --window EXE [--title TEXT]  --auto-window
+audio options: --no-audio  --no-mic  --mute game|voice|media  --mute-after S mix|mic|game|voice|media  --game <exe|pid>  --voice <exe|pid>  --media <exe|pid>
   (--game/--voice/--media repeat and replace that track's defaults)";
 
 fn main() -> ExitCode {
@@ -56,6 +56,10 @@ fn positive(arg: Option<&String>) -> Result<u32, String> {
 struct AudioArgs {
     off: bool,
     no_mic: bool,
+    /// Tracks switched off with `--mute`: their apps are not recorded at all.
+    mute: Vec<String>,
+    /// `--mute-after S track`: mute a track S seconds into the run, live.
+    mute_after: Option<(u64, TrackKind)>,
     game: Option<Vec<Target>>,
     voice: Option<Vec<Target>>,
     media: Option<Vec<Target>>,
@@ -70,6 +74,14 @@ impl AudioArgs {
         let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
         let mut o = AudioOptions::defaults(AudioCodec::for_extension(ext));
         o.mic = !self.no_mic;
+        for m in &self.mute {
+            match m.as_str() {
+                "game" => o.track_game = false,
+                "voice" => o.track_voice = false,
+                _ => o.track_media = false,
+            }
+            o.muting = true;
+        }
         if let Some(t) = self.game {
             o.game = t;
         }
@@ -99,6 +111,22 @@ fn video_options(
         match a.as_str() {
             "--no-audio" => audio.off = true,
             "--no-mic" => audio.no_mic = true,
+            "--mute-after" => {
+                let secs = positive(it.next())?;
+                let kind = match it.next().map(String::as_str) {
+                    Some("mix") => TrackKind::Mix,
+                    Some("mic") => TrackKind::Mic,
+                    Some("game") => TrackKind::Game,
+                    Some("voice") => TrackKind::Voice,
+                    Some("media") => TrackKind::Media,
+                    _ => return Err(USAGE.to_string()),
+                };
+                audio.mute_after = Some((u64::from(secs), kind));
+            }
+            "--mute" => match it.next().map(String::as_str) {
+                Some(t @ ("game" | "voice" | "media")) => audio.mute.push(t.to_string()),
+                _ => return Err(USAGE.to_string()),
+            },
             "--game" => audio.game.get_or_insert_with(Vec::new).push(target(it.next())?),
             "--voice" => audio.voice.get_or_insert_with(Vec::new).push(target(it.next())?),
             "--media" => audio.media.get_or_insert_with(Vec::new).push(target(it.next())?),
@@ -112,6 +140,12 @@ fn video_options(
             }
             "--fps" => video.preset.fps = positive(it.next())?,
             "--display" => video.display = Some(positive(it.next())?),
+            "--window" => {
+                video.source.kind = suicap_core::config::SourceKind::App;
+                video.source.exe = it.next().ok_or("--window needs a program name like game.exe")?.clone();
+            }
+            "--title" => video.source.title = it.next().ok_or("--title needs text")?.clone(),
+            "--auto-window" => video.source.kind = suicap_core::config::SourceKind::Auto,
             "--no-cursor" => video.cursor = false,
             path if !path.starts_with("--") && out.is_none() => out = Some(PathBuf::from(path)),
             _ => return Err(USAGE.to_string()),
@@ -151,7 +185,17 @@ fn record(args: &[String]) -> Result<(), String> {
         Some(p) => p,
         None => pipeline::default_output_path(&cwd()?, "mkv"),
     };
+    let mute_after = audio.mute_after;
     let audio = audio.build(&out);
+    if let (Some((after, kind)), Some(a)) = (mute_after, audio.as_ref()) {
+        // Flip the live switch part-way through, as the settings page does.
+        let live = a.live.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(after));
+            live.set(kind, false);
+            eprintln!("muted {} at {after} s", kind.title());
+        });
+    }
     eprintln!("recording {secs} s to {} ...", out.display());
     let s = pipeline::record(&RecordOptions {
         secs,
@@ -345,6 +389,16 @@ fn session(args: &[String]) -> Result<(), String> {
                 let _ = saved_tx.send(());
             }
             SessionEvent::SaveFailed(m) => println!("[{t:8.1}] save failed: {m}"),
+            SessionEvent::RecordingStarted => println!("[{t:8.1}] recording started"),
+            SessionEvent::RecordingSaved(c) => println!(
+                "[{t:8.1}] recording saved {} ({} packets, {:.1} s)",
+                c.path.display(),
+                c.packets,
+                (c.last_pts_us - c.first_pts_us) as f64 / 1e6
+            ),
+            SessionEvent::RecordingFailed(m) => println!("[{t:8.1}] recording failed: {m}"),
+            SessionEvent::ScreenshotSaved(p) => println!("[{t:8.1}] screenshot {}", p.display()),
+            SessionEvent::ScreenshotFailed(m) => println!("[{t:8.1}] screenshot failed: {m}"),
             SessionEvent::Recovering(m) => println!("[{t:8.1}] RECOVERING: {m}"),
             SessionEvent::Stopped(err) => println!("[{t:8.1}] stopped: {}", err.as_deref().unwrap_or("ok")),
         }

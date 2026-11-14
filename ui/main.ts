@@ -4,18 +4,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, onSettings, type Theme } from "./api";
 import Settings from "./Settings.svelte";
 import Menu from "./Menu.svelte";
+import Badge from "./Badge.svelte";
+import { mountTooltips } from "./tooltip";
 
-// No browser context menu in release builds (Tauri workflow §8); text fields keep it
-// for copy and paste.
+// The browser's own context menu is never shown (dev or release, text fields included): the
+// page draws its own (ContextMenu.svelte), which has Cut / Copy / Paste for text fields.
+document.addEventListener("contextmenu", (e) => e.preventDefault(), { capture: true });
+
 if (import.meta.env.PROD) {
-  document.addEventListener(
-    "contextmenu",
-    (e) => {
-      const t = e.target as HTMLElement | null;
-      if (!t?.closest("input, textarea, [contenteditable]")) e.preventDefault();
-    },
-    { capture: true },
-  );
   document.addEventListener("keydown", (e) => {
     const k = e.key.toLowerCase();
     if (e.key === "F5" || e.key === "F12" || (e.ctrlKey && (k === "r" || k === "p" || (e.shiftKey && k === "i")))) {
@@ -37,6 +33,11 @@ media.addEventListener("change", () => applyTheme(theme));
 
 async function start() {
   const win = getCurrentWindow();
+  if (win.label === "badge") {
+    document.documentElement.classList.add("badge-window");
+    mount(Badge, { target: document.getElementById("app")! });
+    return; // the shell shows it once it is hidden from capture
+  }
   const settings = await api.configGet();
   applyTheme(settings.theme);
   onSettings((s) => applyTheme(s.theme));
@@ -46,6 +47,7 @@ async function start() {
     mount(Menu, { target });
   } else {
     mount(Settings, { target, props: { initial: settings } });
+    mountTooltips();
     await win.setTheme(settings.theme === "system" ? null : settings.theme);
     await win.show();
     await win.setFocus();

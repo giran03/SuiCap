@@ -1,4 +1,5 @@
-/* Shared tokens for the settings window and the tray menu (Tauri workflow §5.2/5.8).
+/* SuiNotch design language for the settings window and the tray menu.
+   Ink background, translucent white surfaces, Sui Blue accent, spring motion.
    Dark is the default; light follows html[data-theme="light"]. */
 :root {
   color-scheme: dark;
@@ -6,54 +7,90 @@
   --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
   --mono: "Cascadia Mono", Consolas, monospace;
 
-  --bg: #101114;
-  --surface: #17191d;
-  --surface-2: #1e2126;
-  --surface-3: #262a31;
-  --line: #2b2f36;
-  --line-strong: #3a3f48;
-  --text: #eceef2;
-  --text-2: #a3a9b4;
-  --text-3: #6f7682;
-  --accent: #ef4444;
-  --accent-strong: #f25c5c;
-  --accent-soft: rgb(239 68 68 / 0.14);
-  --ok: #34d399;
-  --warn: #f59e0b;
-  --warn-soft: rgb(245 158 11 / 0.12);
-  --focus: #7aa7ff;
+  /* Surfaces are white at low alpha over the ink background, as in SuiNotch. */
+  --bg: #131417;
+  --sidebar: #17181c;
+  --surface: rgb(255 255 255 / 0.05);
+  --surface-2: rgb(255 255 255 / 0.07);
+  --surface-3: rgb(255 255 255 / 0.1);
+  --surface-solid: #1c1d22; /* for popups, which must stay opaque */
+  --line: rgb(255 255 255 / 0.07);
+  --line-strong: rgb(255 255 255 / 0.14);
+  --text: #ffffff;
+  --text-2: rgb(255 255 255 / 0.62);
+  --text-3: rgb(255 255 255 / 0.4);
+  --accent: #3ba7ff; /* Sui Blue */
+  --accent-strong: #62b9ff;
+  --accent-soft: rgb(59 167 255 / 0.16);
+  --on-accent: #06121d;
+  --rec: #ff453a; /* recording and destructive */
+  --rec-soft: rgb(255 69 58 / 0.18);
+  --ok: #30d158;
+  --warn: #ffb340;
+  --warn-soft: rgb(255 179 64 / 0.12);
+  --focus: #3ba7ff;
+  --knob: #ffffff;
+  --off: rgb(255 255 255 / 0.16);
+  --off-hover: rgb(255 255 255 / 0.22);
 
-  --radius: 8px;
-  --radius-sm: 6px;
-  --shadow-menu: 0 10px 30px rgb(0 0 0 / 0.45), 0 2px 6px rgb(0 0 0 / 0.35);
+  --radius: 14px;
+  --radius-md: 10px;
+  --radius-sm: 9px;
+  --shadow-menu: 0 14px 36px rgb(0 0 0 / 0.5), 0 2px 8px rgb(0 0 0 / 0.4);
+
+  /* Motion. --spring is a damped spring sampled as a CSS easing (slight overshoot),
+     --ease a soft decelerate for fades and slides. */
+  --spring: linear(
+    0, 0.009, 0.035 2.1%, 0.141 4.4%, 0.723 12.9%, 0.938 16.7%, 1.017 19.7%, 1.046 22.7%,
+    1.054 26.2%, 1.036 32.1%, 1.008 38%, 0.998 46%, 1
+  );
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
-  --fast: 120ms;
+  --fast: 140ms;
+  --med: 260ms;
+  --slow: 480ms;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f5f7;
-  --surface: #ffffff;
-  --surface-2: #f0f1f4;
-  --surface-3: #e5e7eb;
-  --line: #e2e4e9;
-  --line-strong: #cdd1d8;
-  --text: #15171b;
-  --text-2: #555c68;
-  --text-3: #8a909b;
-  --accent: #dc2626;
-  --accent-strong: #c81e1e;
-  --accent-soft: rgb(220 38 38 / 0.1);
-  --ok: #059669;
+  --bg: #eef0f4;
+  --sidebar: #f6f7f9;
+  --surface: rgb(255 255 255 / 0.85);
+  --surface-2: rgb(15 20 30 / 0.05);
+  --surface-3: rgb(15 20 30 / 0.09);
+  --surface-solid: #ffffff;
+  --line: rgb(15 20 30 / 0.08);
+  --line-strong: rgb(15 20 30 / 0.16);
+  --text: #14161a;
+  --text-2: rgb(20 22 26 / 0.64);
+  --text-3: rgb(20 22 26 / 0.42);
+  --accent: #1b8ff0;
+  --accent-strong: #0a7bdc;
+  --accent-soft: rgb(27 143 240 / 0.14);
+  --on-accent: #ffffff;
+  --rec: #e5362b;
+  --rec-soft: rgb(229 54 43 / 0.12);
+  --ok: #1f9d46;
   --warn: #b45309;
   --warn-soft: rgb(180 83 9 / 0.1);
-  --focus: #2563eb;
-  --shadow-menu: 0 10px 30px rgb(15 20 30 / 0.16), 0 2px 6px rgb(15 20 30 / 0.1);
+  --focus: #1b8ff0;
+  --knob: #ffffff;
+  --off: rgb(15 20 30 / 0.18);
+  --off-hover: rgb(15 20 30 / 0.26);
+  --shadow-menu: 0 14px 36px rgb(15 20 30 / 0.18), 0 2px 8px rgb(15 20 30 / 0.12);
 }
 
 @media (prefers-reduced-motion: reduce) {
   :root {
     --fast: 0ms;
+    --med: 0ms;
+    --slow: 0ms;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0ms !important;
+    animation-delay: 0ms !important;
+    transition-duration: 0ms !important;
   }
 }
 
@@ -88,7 +125,93 @@ select {
   outline-offset: 2px;
 }
 
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 6px;
+  background: var(--line-strong) padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3) padding-box;
+}
+
 img,
 a {
   -webkit-user-drag: none;
+}
+
+/* ---------- tooltip (ui/tooltip.ts, ported from the CafeTako Site Builder) ----------
+ * One shared bubble. Appear: fade + scale with a short delay; leave: near-instant. Moving to a
+ * neighbouring trigger tweens translate + width instead of popping a second bubble. */
+:root {
+  --tt-in-dur: 150ms;
+  --tt-out-dur: 50ms;
+  --tt-scale: 0.98;
+  --tt-delay: 80ms;
+  --tt-in-ease: ease-out;
+  --tt-out-ease: ease-out;
+  --tt-move-dur: 160ms;
+  --tt-move-ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+.t-tt {
+  position: fixed;
+  z-index: 10000;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0;
+  max-width: min(260px, calc(100vw - 16px));
+  overflow: hidden;
+  translate: var(--tt-x, 0px) var(--tt-y, 0px);
+  scale: var(--tt-scale);
+  transform-origin: 50% 100%;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--text);
+  color: var(--bg);
+  font-size: 12px;
+  line-height: 1.3;
+  white-space: nowrap;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.06),
+    0 2px 6px 0 rgba(0, 0, 0, 0.05),
+    0 4px 42px 0 rgba(0, 0, 0, 0.06);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--tt-out-dur) var(--tt-out-ease),
+    scale var(--tt-out-dur) var(--tt-out-ease),
+    translate var(--tt-move-dur) var(--tt-move-ease),
+    width var(--tt-move-dur) var(--tt-move-ease);
+}
+.t-tt[data-show="true"] {
+  opacity: 1;
+  scale: 1;
+  transition:
+    opacity var(--tt-in-dur) var(--tt-in-ease) var(--tt-delay),
+    scale var(--tt-in-dur) var(--tt-in-ease) var(--tt-delay),
+    translate var(--tt-move-dur) var(--tt-move-ease),
+    width var(--tt-move-dur) var(--tt-move-ease);
+}
+/* The bubble is never a hover target: the pointer passes straight through to what is underneath. */
+.t-tt,
+.t-tt * {
+  pointer-events: none !important;
+}
+.t-tt-text {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
+  text-align: start;
+}
+@media (prefers-reduced-motion: reduce) {
+  .t-tt {
+    transition: none !important;
+  }
 }

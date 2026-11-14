@@ -114,8 +114,9 @@ pub enum PresetName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Container {
-    #[default]
     Mp4,
+    /// The default: it names every audio track (Mix, Game, Voice chat...) in players.
+    #[default]
     Mkv,
 }
 
@@ -126,6 +127,46 @@ impl Container {
             Container::Mkv => "mkv",
         }
     }
+}
+
+/// The glyph at the start of the recording badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BadgeIcon {
+    #[default]
+    Dot,
+    Ring,
+    Square,
+    Play,
+    Camera,
+    Bolt,
+    /// An image the user chose (`badge-icon.bin` next to the settings).
+    Custom,
+    None,
+}
+
+/// Which corner of the recorded monitor the recording badge sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BadgeCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+}
+
+/// How the app treats new releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateMode {
+    /// Never check by itself.
+    Off,
+    /// Check and say so; the user chooses when to install.
+    #[default]
+    Notify,
+    /// Download in the background and install while the PC is idle.
+    Auto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -174,12 +215,43 @@ pub const MEDIA_APPS: [&str; 6] = [
     "opera.exe",
 ];
 const MAX_APPS: usize = 32;
+/// Parked apps are not recorded, so the list may hold more than a track does.
+const MAX_IGNORED: usize = 64;
+
+/// Which tracks are recorded. Game, Voice and Media off means **mute**: their apps are not
+/// captured at all, so they are not in the Mix either. Mix off only drops the combined track.
+/// (The Mic track follows `AudioSettings::mic`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioTracks {
+    pub mix: bool,
+    pub game: bool,
+    pub voice: bool,
+    pub media: bool,
+}
+
+impl Default for AudioTracks {
+    fn default() -> Self {
+        Self {
+            mix: true,
+            game: true,
+            voice: true,
+            media: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
     pub enabled: bool,
+    /// Record the microphone (and write the Mic track).
     pub mic: bool,
+    /// Capture endpoint id of the chosen microphone; `None` = the system default input.
+    pub mic_device: Option<String>,
+    pub tracks: AudioTracks,
+    /// Apps that are never recorded: they win over every track list.
+    pub ignored: Vec<String>,
     /// Empty = the fullscreen app in the foreground when capture starts.
     pub game: Vec<String>,
     pub voice: Vec<String>,
@@ -192,6 +264,9 @@ impl Default for AudioSettings {
         Self {
             enabled: true,
             mic: true,
+            mic_device: None,
+            tracks: AudioTracks::default(),
+            ignored: Vec::new(),
             game: Vec::new(),
             voice: own(&VOICE_APPS),
             media: own(&MEDIA_APPS),
@@ -208,6 +283,10 @@ pub struct Hotkeys {
     pub save_30: String,
     pub save_60: String,
     pub save_full: String,
+    /// Save a PNG of the screen.
+    pub screenshot: String,
+    /// Switch between recording the app in front and the whole display.
+    pub target_app: String,
 }
 
 impl Default for Hotkeys {
@@ -217,11 +296,25 @@ impl Default for Hotkeys {
             save_30: "Ctrl+Alt+F10".into(),
             save_60: "Ctrl+Alt+F11".into(),
             save_full: "Ctrl+Alt+F12".into(),
+            screenshot: "Ctrl+Alt+F8".into(),
+            target_app: "Ctrl+Alt+F7".into(),
         }
     }
 }
 
 impl Hotkeys {
+    /// Every accelerator, for validation.
+    pub fn all(&self) -> [&str; 6] {
+        [
+            &self.save_15,
+            &self.save_30,
+            &self.save_60,
+            &self.save_full,
+            &self.screenshot,
+            &self.target_app,
+        ]
+    }
+
     /// `(seconds to save, accelerator)`; `None` seconds = the whole buffer.
     pub fn bindings(&self) -> [(Option<u32>, &str); 4] {
         [
@@ -233,6 +326,55 @@ impl Hotkeys {
     }
 }
 
+/// What video capture records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    /// A whole monitor.
+    #[default]
+    Display,
+    /// One application's window, chosen by program name.
+    App,
+    /// The full-screen game in front, else the display.
+    Auto,
+}
+
+/// The video source: a display, one application, or automatic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourceSettings {
+    pub kind: SourceKind,
+    /// Program of the chosen app, e.g. `game.exe` (kind `App`).
+    pub exe: String,
+    /// Only the window whose title contains this; empty = any window of the app.
+    pub title: String,
+    /// While the app is not there, record the display instead of holding the last frame.
+    pub fallback: bool,
+}
+
+impl Default for SourceSettings {
+    fn default() -> Self {
+        Self {
+            kind: SourceKind::Display,
+            exe: String::new(),
+            title: String::new(),
+            fallback: true,
+        }
+    }
+}
+
+pub const MAX_SOURCE_TITLE: usize = 200;
+
+pub const MAX_QUOTA_GB: u32 = 100_000;
+pub const BADGE_SCALE: std::ops::RangeInclusive<u32> = 60..=250;
+pub const BADGE_OPACITY: std::ops::RangeInclusive<u32> = 20..=100;
+pub const MAX_BADGE_MARGIN: u32 = 400;
+pub const MAX_BADGE_LABEL: usize = 16;
+
+/// `#rrggbb`, nothing else (the value ends up in CSS).
+pub fn is_hex_color(c: &str) -> bool {
+    c.len() == 7 && c.starts_with('#') && c[1..].bytes().all(|b| b.is_ascii_hexdigit())
+}
 pub const BUFFER_SECS: std::ops::RangeInclusive<u32> = 10..=600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +390,8 @@ pub struct Settings {
     pub cursor: bool,
     /// `\\.\DISPLAY<n>`; `None` = primary monitor.
     pub display: Option<u32>,
+    /// Display, one application or automatic.
+    pub source: SourceSettings,
     pub audio: AudioSettings,
     pub hotkeys: Hotkeys,
     pub save_sound: bool,
@@ -256,6 +400,33 @@ pub struct Settings {
     /// Start filling the replay buffer as soon as the app starts.
     pub arm_on_start: bool,
     pub theme: Theme,
+    pub update_mode: UpdateMode,
+    /// Delete the oldest clips once the library passes this many GB; 0 = never.
+    pub clips_quota_gb: u32,
+    /// Show a badge on the recorded monitor while recording (never captured).
+    pub recording_badge: bool,
+    pub badge_corner: BadgeCorner,
+    /// Also show it while the replay buffer runs, not only during a recording.
+    pub badge_during_replay: bool,
+    /// Badge size in percent of the default.
+    pub badge_scale: u32,
+    /// Background opacity in percent.
+    pub badge_opacity: u32,
+    /// `#rrggbb` colours: background, text, the recording dot, the replay dot.
+    pub badge_bg: String,
+    pub badge_text: String,
+    pub badge_rec_color: String,
+    pub badge_replay_color: String,
+    /// Distance from the monitor edge, in logical pixels.
+    pub badge_margin: u32,
+    pub badge_show_time: bool,
+    pub badge_show_label: bool,
+    /// Briefly show "Clip saved · N s" on the badge when a clip is saved, label or not.
+    pub badge_clip_flash: bool,
+    /// Text while recording and while only replay is on (at most `MAX_BADGE_LABEL` characters).
+    pub badge_label_rec: String,
+    pub badge_label_replay: String,
+    pub badge_icon: BadgeIcon,
 }
 
 impl Default for Settings {
@@ -268,6 +439,7 @@ impl Default for Settings {
             clips_dir: None,
             cursor: true,
             display: None,
+            source: SourceSettings::default(),
             audio: AudioSettings::default(),
             hotkeys: Hotkeys::default(),
             save_sound: true,
@@ -275,6 +447,24 @@ impl Default for Settings {
             autostart: false,
             arm_on_start: true,
             theme: Theme::default(),
+            update_mode: UpdateMode::default(),
+            clips_quota_gb: 0,
+            recording_badge: true,
+            badge_corner: BadgeCorner::default(),
+            badge_during_replay: true,
+            badge_scale: 100,
+            badge_opacity: 88,
+            badge_bg: "#121317".into(),
+            badge_text: "#f2f2f4".into(),
+            badge_rec_color: "#ef4444".into(),
+            badge_replay_color: "#3ba7ff".into(),
+            badge_margin: 16,
+            badge_show_time: true,
+            badge_show_label: true,
+            badge_clip_flash: true,
+            badge_label_rec: "REC".into(),
+            badge_label_replay: "REPLAY".into(),
+            badge_icon: BadgeIcon::default(),
         }
     }
 }
@@ -316,6 +506,18 @@ impl Settings {
         if !(source || dim(v.width) && dim(v.height)) {
             return invalid("custom resolution must be even, 320 to 7680 pixels (or 0 x 0 for the monitor size)");
         }
+        let src = &self.source;
+        if src.kind == SourceKind::App
+            && !(src.exe.len() >= 5
+                && src.exe.len() <= 64
+                && src.exe.to_ascii_lowercase().ends_with(".exe")
+                && !src.exe.chars().any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c)))
+        {
+            return invalid("the application to record must be a program name like game.exe");
+        }
+        if src.title.chars().count() > MAX_SOURCE_TITLE || src.title.chars().any(char::is_control) {
+            return invalid("the window title is not valid");
+        }
         if !(10..=240).contains(&v.fps) {
             return invalid("frame rate must be 10 to 240");
         }
@@ -355,8 +557,45 @@ impl Settings {
                 check_app(kind, name)?;
             }
         }
+        if let Some(id) = &self.audio.mic_device
+            && (id.is_empty() || id.len() > 200 || id.chars().any(char::is_control))
+        {
+            return invalid("the microphone id is not valid");
+        }
+        if self.audio.ignored.len() > MAX_IGNORED {
+            return invalid(format!("at most {MAX_IGNORED} apps that are not recorded"));
+        }
+        for name in &self.audio.ignored {
+            check_app("ignored", name)?;
+        }
+        if self.clips_quota_gb > MAX_QUOTA_GB {
+            return invalid(format!("the clip storage limit is at most {MAX_QUOTA_GB} GB"));
+        }
+        if !BADGE_SCALE.contains(&self.badge_scale) || !BADGE_OPACITY.contains(&self.badge_opacity) {
+            return invalid("the badge size or opacity is out of range");
+        }
+        if self.badge_margin > MAX_BADGE_MARGIN {
+            return invalid(format!("the badge margin is at most {MAX_BADGE_MARGIN} px"));
+        }
+        for c in [
+            &self.badge_bg,
+            &self.badge_text,
+            &self.badge_rec_color,
+            &self.badge_replay_color,
+        ] {
+            if !is_hex_color(c) {
+                return invalid(format!("\"{c}\" is not a colour like #3ba7ff"));
+            }
+        }
+        for label in [&self.badge_label_rec, &self.badge_label_replay] {
+            if label.chars().count() > MAX_BADGE_LABEL || label.chars().any(char::is_control) {
+                return invalid(format!(
+                    "a badge label is at most {MAX_BADGE_LABEL} characters, on one line"
+                ));
+            }
+        }
         let mut seen: Vec<String> = Vec::new();
-        for (_, key) in self.hotkeys.bindings() {
+        for key in self.hotkeys.all() {
             if key.is_empty() {
                 continue;
             }
@@ -473,6 +712,7 @@ mod tests {
         assert_eq!(s.preset, PresetName::High);
         assert_eq!(s.buffer_secs, 60);
         assert_eq!(s.hotkeys, Hotkeys::default());
+        assert_eq!(s.container, Container::Mkv);
         assert_eq!(s.video().width, 0);
     }
 
@@ -492,6 +732,32 @@ mod tests {
         assert!(bad(|s| s.clips_dir = Some(r"C:\Clips\..\Windows".into())));
         assert!(bad(|s| s.audio.voice.push("..\\evil.exe".into())));
         assert!(bad(|s| s.audio.media.push("notepad".into())));
+        assert!(bad(|s| s.audio.ignored.push("a/b.exe".into())));
+        assert!(bad(|s| s.audio.mic_device = Some(String::new())));
+        assert!(bad(|s| s.audio.mic_device = Some("x".repeat(201))));
+        // a recorded application must be a plain program name
+        assert!(bad(|s| (s.source.kind, s.source.exe) = (SourceKind::App, String::new())));
+        assert!(bad(|s| (s.source.kind, s.source.exe) = (SourceKind::App, "a/b.exe".into())));
+        assert!(bad(|s| (s.source.kind, s.source.exe) = (SourceKind::App, "game".into())));
+        assert!(bad(|s| s.source.title = "x".repeat(201)));
+        assert!(bad(
+            |s| s.audio.ignored = (0..65).map(|i| format!("app{i}.exe")).collect()
+        ));
+        assert!(bad(|s| s.badge_bg = "red".into()));
+        assert!(bad(|s| s.badge_text = "#12345".into()));
+        assert!(bad(|s| s.badge_rec_color = "#12345g".into()));
+        assert!(bad(|s| s.badge_rec_color = "#fff; x: y".into()));
+        assert!(bad(|s| s.badge_scale = 10));
+        assert!(bad(|s| s.badge_opacity = 5));
+        assert!(bad(|s| s.badge_margin = 9999));
+        assert!(bad(|s| s.badge_label_rec = "x".repeat(17)));
+        assert!(bad(|s| s.badge_label_replay = "a\nb".into()));
+        let ok = Settings {
+            badge_label_rec: "Mação ●".into(), // any text, including empty or non-ASCII
+            badge_label_replay: String::new(),
+            ..Settings::default()
+        };
+        ok.validate().unwrap();
         assert!(bad(|s| s.hotkeys.save_15 = "ctrl+alt+f10".into())); // duplicate of save_30
         let mut s = Settings::default();
         s.custom.width = 0;

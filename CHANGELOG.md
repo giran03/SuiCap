@@ -10,3 +10,6 @@
 - Settings window with video presets (Compatible, Balanced, High, Custom), monitor choice, mouse pointer, buffer length, MP4 or MKV, clips folder, audio sources, shortcuts, light or dark theme.
 - Separate audio tracks for microphone, game, voice chat and music, plus a mixed track that plays by default.
 - Option to start with Windows in the tray and to turn replay on at start.
+- Clips page: thumbnails, lossless trim (saved as a new copy, the original is kept), delete to the Recycle Bin, and an optional storage limit that removes the oldest clips.
+- Screenshot button and shortcut (default Ctrl+Alt+F8) that saves a PNG of the screen next to your clips.
+- About page with developer and support links, and an Updates page that checks GitHub releases, checks each installer against its checksum, and can install automatically while you are away (default: notify only).

@@ -25,8 +25,8 @@ echo ==== cargo clippy ====
 cargo clippy --workspace --all-targets -- -D warnings || goto :fail
 echo ==== cargo test ====
 cargo test --workspace || goto :fail
-echo ==== zero-copy guard: no Map( on frame textures ====
-powershell -NoProfile -Command "$hits = Get-ChildItem crates -Recurse -Filter *.rs | Select-String -CaseSensitive -Pattern '\.Map\(' ; if ($hits) { $hits; exit 1 }" || goto :fail
+echo ==== zero-copy guard: no Map( on frame textures (shot.rs, the screenshot, is the one exception) ====
+powershell -NoProfile -Command "$hits = Get-ChildItem crates -Recurse -Filter *.rs | Where-Object { $_.Name -ne 'shot.rs' } | Select-String -CaseSensitive -Pattern '\.Map\(' ; if ($hits) { $hits; exit 1 }" || goto :fail
 
 echo.
 echo All checks passed.

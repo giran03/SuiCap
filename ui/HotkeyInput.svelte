@@ -3,6 +3,13 @@
   // accelerator syntax the global-shortcut plugin parses ("Ctrl+Alt+F10").
   let { value, onchange }: { value: string; onchange: (v: string) => void } = $props();
   let recording = $state(false);
+  let btn = $state<HTMLButtonElement>();
+
+  /** Start listening for a new combination (the context menu's "Change shortcut"). */
+  export function start() {
+    recording = true;
+    btn?.focus();
+  }
   let hint = $state("");
 
   function keyName(e: KeyboardEvent): string | null {
@@ -44,6 +51,7 @@
 </script>
 
 <button
+  bind:this={btn}
   class="hotkey"
   class:recording
   onclick={() => (recording = !recording)}
@@ -63,38 +71,59 @@
 <style>
   .hotkey {
     display: inline-flex;
-    gap: 4px;
+    gap: 5px;
     align-items: center;
     min-width: 172px;
-    height: 32px;
-    padding: 0 8px;
-    border: 1px solid var(--line-strong);
+    height: 34px;
+    padding: 0 9px;
+    border: 0;
     border-radius: var(--radius-sm);
     background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px transparent;
     cursor: pointer;
-    transition: border-color var(--fast) var(--ease);
+    transition:
+      background var(--fast) var(--ease),
+      box-shadow var(--med) var(--ease),
+      transform var(--med) var(--spring);
   }
   .hotkey:hover {
-    border-color: var(--text-3);
+    background: var(--surface-3);
   }
-  .recording {
-    border-color: var(--accent);
+  .hotkey:active {
+    transform: scale(0.98);
+  }
+  .recording,
+  .recording:hover {
     background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1.5px var(--accent);
   }
   kbd {
-    padding: 1px 6px;
-    border: 1px solid var(--line-strong);
-    border-bottom-width: 2px;
-    border-radius: 4px;
-    background: var(--surface);
-    font: 12px var(--font);
+    padding: 1px 7px;
+    border-radius: 6px;
+    background: var(--surface-3);
+    box-shadow: inset 0 -2px 0 var(--line);
+    font: 600 12px var(--font);
+    animation: key-in var(--med) var(--spring);
+  }
+  @keyframes key-in {
+    from {
+      opacity: 0;
+      transform: translateY(3px);
+    }
   }
   .none,
   .rec {
     color: var(--text-3);
-    font-size: 13px;
+    font-size: 12.5px;
+    font-weight: 500;
   }
   .rec {
     color: var(--text);
+    animation: blink 1.4s ease-in-out infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0.55;
+    }
   }
 </style>

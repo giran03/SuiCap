@@ -98,7 +98,10 @@ fn probe_adapter(a: &Adapter) -> crate::Result<AdapterReport> {
     })
 }
 
-fn probe_encoders(vendor: Vendor, device: &windows::Win32::Graphics::Direct3D11::ID3D11Device) -> Vec<EncoderReport> {
+pub(crate) fn probe_encoders(
+    vendor: Vendor,
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+) -> Vec<EncoderReport> {
     let preset = VideoPreset::P1080_60;
     let frames = HwDevice::wrap(device)
         .and_then(|d| HwFrames::new(&d, SwFormat::Nv12, preset.width, preset.height).map(|f| (d, f)));

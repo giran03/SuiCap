@@ -95,28 +95,59 @@ pub fn place_menu(icon: Px, monitor: Px, work: Px, size: (i32, i32)) -> (i32, i3
     }
 }
 
-/// A 32x32 tray glyph: a ring with a dot, red when armed, amber on error.
+/// The logo's small-size cut on the 256 grid: two slices and the tip (the last entry).
+/// Each polygon is convex, listed in order.
+const GLYPH: [&[(f32, f32)]; 3] = [
+    &[(48.3, 36.0), (96.3, 63.7), (96.3, 192.3), (48.3, 220.0)],
+    &[(110.3, 71.8), (158.3, 99.5), (158.3, 156.5), (110.3, 184.2)],
+    &[(172.3, 107.4), (207.7, 128.0), (172.3, 148.6)],
+];
+
+fn inside(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..poly.len() {
+        let (ax, ay) = poly[i];
+        let (bx, by) = poly[(i + 1) % poly.len()];
+        let cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+        if cross != 0.0 {
+            if sign != 0.0 && cross.signum() != sign.signum() {
+                return false;
+            }
+            sign = cross;
+        }
+    }
+    true
+}
+
+/// A 32x32 tray glyph: the logo's slices, with the play tip showing the state (red when
+/// armed, grey while starting, amber on error; all grey when off).
 fn icon_image(phase: Phase) -> Image<'static> {
     const N: usize = 32;
-    let (ring, dot): ([u8; 3], Option<[u8; 3]>) = match phase {
-        Phase::Armed => ([240, 240, 240], Some([239, 68, 68])),
-        Phase::Starting | Phase::Recovering => ([240, 240, 240], Some([160, 160, 160])),
-        Phase::Error => ([245, 158, 11], Some([245, 158, 11])),
-        Phase::Idle => ([170, 170, 170], None),
+    const SS: usize = 4; // samples per pixel side
+    let (body, tip): ([u8; 3], [u8; 3]) = match phase {
+        Phase::Armed => ([240, 240, 240], [239, 68, 68]),
+        Phase::Starting | Phase::Recovering => ([240, 240, 240], [160, 160, 160]),
+        Phase::Error => ([245, 158, 11], [245, 158, 11]),
+        Phase::Idle => ([170, 170, 170], [170, 170, 170]),
     };
+    let k = 256.0 / N as f32;
     let mut rgba = vec![0u8; N * N * 4];
-    let c = (N as f32 - 1.0) / 2.0;
     for y in 0..N {
         for x in 0..N {
-            let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
-            // Ring: radius 13..15.5; dot: radius 7.5. 1 px anti-aliased edges.
-            let ring_a = ((15.5 - d).min(d - 12.5)).clamp(0.0, 1.0);
-            let dot_a = dot.map_or(0.0, |_| (7.5 - d).clamp(0.0, 1.0));
-            let (col, a) = if dot_a > 0.0 {
-                (dot.unwrap_or(ring), dot_a)
-            } else {
-                (ring, ring_a)
-            };
+            let mut hits = [0usize; 3];
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let px = (x as f32 + (sx as f32 + 0.5) / SS as f32) * k;
+                    let py = (y as f32 + (sy as f32 + 0.5) / SS as f32) * k;
+                    for (h, poly) in hits.iter_mut().zip(GLYPH) {
+                        *h += usize::from(inside(poly, px, py));
+                    }
+                }
+            }
+            let total = (SS * SS) as f32;
+            let tip_a = hits[2] as f32 / total;
+            let body_a = (hits[0] + hits[1]) as f32 / total;
+            let (col, a) = if tip_a > 0.0 { (tip, tip_a) } else { (body, body_a) };
             let i = (y * N + x) * 4;
             rgba[i..i + 3].copy_from_slice(&col);
             rgba[i + 3] = (a * 255.0) as u8;
@@ -175,22 +206,30 @@ pub fn refresh(app: &AppHandle, st: &Status) {
 }
 
 pub fn open_settings(app: &AppHandle) {
+    suicap_core::apps::warm_up(); // the audio page hides apps that are not installed
     if let Some(w) = app.get_webview_window(SETTINGS) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
         return;
     }
-    let built = WebviewWindowBuilder::new(app, SETTINGS, WebviewUrl::App("index.html".into()))
-        .title("SuiCap")
-        .inner_size(860.0, 680.0)
-        .min_inner_size(640.0, 480.0)
-        .center()
-        .visible(false) // the page shows it once styled, so no white flash
-        .build();
-    if let Err(e) = built {
-        eprintln!("settings window: {e}");
-    }
+    // Built off the event-loop thread: with no webview open, WebView2 has to start up and
+    // needs the loop free to do it (building inline from a tray event stalls).
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let built = WebviewWindowBuilder::new(&app, SETTINGS, WebviewUrl::App("index.html".into()))
+            .title("SuiCap")
+            .inner_size(1280.0, 780.0)
+            .min_inner_size(1280.0, 640.0)
+            .decorations(false) // the page draws its own title bar (ui/TitleBar.svelte)
+            .disable_drag_drop_handler() // the audio page uses HTML5 drag and drop
+            .center()
+            .visible(false) // the page shows it once styled, so no white flash
+            .build();
+        if let Err(e) = built {
+            eprintln!("settings window: {e}");
+        }
+    });
 }
 
 fn open_menu(app: &AppHandle, rect: Rect, cursor: PhysicalPosition<f64>) {
@@ -212,34 +251,39 @@ fn open_menu(app: &AppHandle, rect: Rect, cursor: PhysicalPosition<f64>) {
         },
         cursor: (cursor.x as i32, cursor.y as i32),
     });
-    let built = WebviewWindowBuilder::new(app, MENU, WebviewUrl::App("index.html".into()))
-        .title("SuiCap menu")
-        .inner_size(260.0, 360.0)
-        .position(-32000.0, -32000.0)
-        .decorations(false)
-        .transparent(true)
-        .shadow(false)
-        .resizable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .visible(false)
-        .build();
-    match built {
-        Ok(w) => {
-            let handle = w.clone();
-            w.on_window_event(move |e| {
-                // Ignore focus changes while still hidden (creation, the tray overflow
-                // flyout taking focus back); only a shown menu closes on blur.
-                if let WindowEvent::Focused(false) = e
-                    && handle.is_visible().unwrap_or(false)
-                {
-                    *lock(&LAST_MENU_CLOSE) = Some(Instant::now());
-                    let _ = handle.close();
-                }
-            });
+    // Off the event-loop thread, like the settings window: the first webview after all
+    // others were closed needs the loop free to start WebView2.
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let built = WebviewWindowBuilder::new(&app, MENU, WebviewUrl::App("index.html".into()))
+            .title("SuiCap menu")
+            .inner_size(260.0, 360.0)
+            .position(-32000.0, -32000.0)
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible(false)
+            .build();
+        match built {
+            Ok(w) => {
+                let handle = w.clone();
+                w.on_window_event(move |e| {
+                    // Ignore focus changes while still hidden (creation, the tray overflow
+                    // flyout taking focus back); only a shown menu closes on blur.
+                    if let WindowEvent::Focused(false) = e
+                        && handle.is_visible().unwrap_or(false)
+                    {
+                        *lock(&LAST_MENU_CLOSE) = Some(Instant::now());
+                        let _ = handle.close();
+                    }
+                });
+            }
+            Err(e) => eprintln!("tray menu: {e}"),
         }
-        Err(e) => eprintln!("tray menu: {e}"),
-    }
+    });
 }
 
 /// The menu page measured itself (logical px): place it at the icon and show it.

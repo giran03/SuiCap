@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::JoinHandle,
@@ -28,7 +28,7 @@ use windows::{
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
             AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
             AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-            ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+            ActivateAudioInterfaceAsync, DEVICE_STATE_ACTIVE, IActivateAudioInterfaceAsyncOperation,
             IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
             IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
             PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
@@ -47,7 +47,7 @@ use windows::{
         },
         UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId},
     },
-    core::{HRESULT, IUnknown, Interface, Ref, implement, w},
+    core::{HRESULT, IUnknown, Interface, PCWSTR, Ref, implement, w},
 };
 
 use crate::{
@@ -82,7 +82,7 @@ const RATE: i64 = AUDIO_RATE as i64;
 const RESYNC_SAMPLES: i64 = RATE / 50;
 /// The mix runs this far behind real time so late WASAPI buffers still land.
 const LATENCY_SAMPLES: i64 = RATE / 10;
-const RESCAN_EVERY: Duration = Duration::from_secs(2);
+const RESCAN_EVERY: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Timeline: pure logic, unit-tested.
@@ -207,6 +207,25 @@ pub fn soft_limit(x: f32) -> f32 {
     }
 }
 
+/// Moves a track's level from `*gain` to `target` across one frame of interleaved stereo
+/// (a linear fade, so muting and unmuting do not click). Settled at 0 it is exact silence.
+fn ramp(samples: &mut [f32], gain: &mut f32, target: f32) {
+    if *gain == target {
+        if target == 0.0 {
+            samples.fill(0.0);
+        }
+        return;
+    }
+    let n = (samples.len() / 2).max(1) as f32;
+    let start = *gain;
+    for (k, frame) in samples.chunks_exact_mut(2).enumerate() {
+        let g = start + (target - start) * (k as f32 + 1.0) / n;
+        frame[0] *= g;
+        frame[1] *= g;
+    }
+    *gain = target;
+}
+
 // ---------------------------------------------------------------------------
 // Tracks and targets.
 
@@ -222,13 +241,14 @@ pub enum TrackKind {
 }
 
 impl TrackKind {
+    /// The track's name in the clip: the same words the settings page uses.
     pub fn title(self) -> &'static str {
         match self {
             TrackKind::Mix => "Mix",
-            TrackKind::Mic => "Mic",
+            TrackKind::Mic => "Microphone",
             TrackKind::Game => "Game",
-            TrackKind::Voice => "Voice",
-            TrackKind::Media => "Media",
+            TrackKind::Voice => "Voice chat",
+            TrackKind::Media => "Music and media",
             TrackKind::Desktop => "Desktop",
         }
     }
@@ -241,13 +261,125 @@ pub enum Target {
     Exe(String),
 }
 
+/// Mute switches shared with the running mixer. Flipping one silences that track at once, with
+/// a short fade and without restarting capture; the track also leaves the Mix. A track that
+/// was off when capture started has no stream to unmute: that still needs a restart.
+#[derive(Debug)]
+pub struct LiveTracks {
+    on: [AtomicBool; 5],
+    /// The chosen microphone (endpoint id); `None` = the system default.
+    mic_device: Mutex<Option<String>>,
+    /// The latest settings, so the mixer can re-route apps while it runs.
+    settings: Mutex<Option<crate::config::AudioSettings>>,
+    /// Bumped whenever the app routing or a track switch changed; the mixer re-routes on it.
+    routes_rev: AtomicU64,
+}
+
+impl LiveTracks {
+    /// Everything audible.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            on: std::array::from_fn(|_| AtomicBool::new(true)),
+            mic_device: Mutex::new(None),
+            settings: Mutex::new(None),
+            routes_rev: AtomicU64::new(0),
+        })
+    }
+
+    fn slot(kind: TrackKind) -> Option<usize> {
+        match kind {
+            TrackKind::Mix => Some(0),
+            TrackKind::Mic => Some(1),
+            TrackKind::Game => Some(2),
+            TrackKind::Voice => Some(3),
+            TrackKind::Media => Some(4),
+            TrackKind::Desktop => None, // the whole desktop: nothing to mute by app
+        }
+    }
+
+    pub fn set(&self, kind: TrackKind, audible: bool) {
+        if let Some(i) = Self::slot(kind) {
+            self.on[i].store(audible, Ordering::Release);
+        }
+    }
+
+    pub fn audible(&self, kind: TrackKind) -> bool {
+        Self::slot(kind).is_none_or(|i| self.on[i].load(Ordering::Acquire))
+    }
+
+    /// Switch microphones; the mixer moves over within a couple of seconds.
+    pub fn set_mic_device(&self, id: Option<String>) {
+        if let Ok(mut g) = self.mic_device.lock() {
+            *g = id;
+        }
+    }
+
+    pub fn mic_device(&self) -> Option<String> {
+        self.mic_device.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// The settings the session started with (not a change: no re-route is triggered).
+    fn remember(&self, s: &crate::config::AudioSettings) {
+        if let Ok(mut g) = self.settings.lock() {
+            *g = Some(s.clone());
+        }
+    }
+
+    fn settings(&self) -> Option<crate::config::AudioSettings> {
+        self.settings.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn routes_rev(&self) -> u64 {
+        self.routes_rev.load(Ordering::Acquire)
+    }
+
+    /// Follow the settings: a track that is switched off is muted, the microphone chosen, and
+    /// apps moved between tracks (or parked / released) are re-routed within about a second,
+    /// with no restart: each moved app's sound resumes on its new track.
+    pub fn apply(&self, s: &crate::config::AudioSettings) {
+        if let Ok(mut g) = self.settings.lock() {
+            let changed = g.as_ref().is_none_or(|old| {
+                old.game != s.game
+                    || old.voice != s.voice
+                    || old.media != s.media
+                    || old.ignored != s.ignored
+                    || old.tracks != s.tracks
+            });
+            *g = Some(s.clone());
+            if changed {
+                self.routes_rev.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        self.set_mic_device(s.mic_device.clone());
+        self.set(TrackKind::Mix, s.tracks.mix);
+        self.set(TrackKind::Mic, s.mic);
+        self.set(TrackKind::Game, s.tracks.game);
+        self.set(TrackKind::Voice, s.tracks.voice);
+        self.set(TrackKind::Media, s.tracks.media);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioOptions {
     pub codec: AudioCodec,
     pub mic: bool,
+    /// Tracks recorded (Mic follows `mic`). Game, Voice and Media off = muted: no sources are
+    /// opened for them, so their apps are not in the Mix either. Mix off drops only the Mix.
+    pub mix: bool,
+    pub track_game: bool,
+    pub track_voice: bool,
+    pub track_media: bool,
+    /// Something is muted (a track is off, or apps are parked as not recorded). Only per-app
+    /// capture can honour that, so the session says so when it is not available.
+    pub muting: bool,
+    /// Live mute switches; keep a clone to mute tracks while capture runs.
+    pub live: Arc<LiveTracks>,
     pub game: Vec<Target>,
     pub voice: Vec<Target>,
     pub media: Vec<Target>,
+    /// The full-screen app an empty Game list stood for when capture started. Kept for the whole
+    /// session, so re-routing while the settings window is in front does not lose the game.
+    foreground: Option<(u32, String)>,
 }
 
 impl AudioOptions {
@@ -258,27 +390,130 @@ impl AudioOptions {
 
     /// From persisted settings; an empty game list means the foreground fullscreen app.
     pub fn from_settings(s: &crate::config::AudioSettings, codec: AudioCodec) -> Self {
-        let exes = |names: &[String]| names.iter().map(|n| Target::Exe(n.clone())).collect();
-        let game = if s.game.is_empty() {
-            foreground_fullscreen_pid().map(Target::Pid).into_iter().collect()
-        } else {
-            exes(&s.game)
-        };
+        Self::for_app(s, codec, None)
+    }
+
+    /// Like `from_settings`, but an empty game list follows `app` (the application chosen as the
+    /// video source, running or not) instead of the full-screen app.
+    pub fn for_app(s: &crate::config::AudioSettings, codec: AudioCodec, app: Option<&str>) -> Self {
+        // The foreground app only matters when the Game track records it.
+        let foreground = (s.tracks.game && s.game.is_empty())
+            .then(|| match app {
+                Some(exe) => Some(
+                    processes()
+                        .into_iter()
+                        .find(|p| p.exe.eq_ignore_ascii_case(exe))
+                        .map_or((0, exe.to_owned()), |p| (p.pid, p.exe)),
+                ),
+                None => foreground_fullscreen_pid()
+                    .and_then(|pid| processes().into_iter().find(|p| p.pid == pid).map(|p| (pid, p.exe))),
+            })
+            .flatten();
+        let routes = route(s, foreground.clone());
         Self {
             codec,
             mic: s.mic,
-            game,
-            voice: exes(&s.voice),
-            media: exes(&s.media),
+            mix: s.tracks.mix,
+            track_game: s.tracks.game,
+            track_voice: s.tracks.voice,
+            track_media: s.tracks.media,
+            muting: !(s.tracks.game && s.tracks.voice && s.tracks.media && s.ignored.is_empty()),
+            live: {
+                let live = LiveTracks::new();
+                live.set_mic_device(s.mic_device.clone());
+                live.remember(s);
+                live
+            },
+            game: routes.game,
+            voice: routes.voice,
+            media: routes.media,
+            foreground,
         }
     }
+}
+
+/// Which apps are captured for each track.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Routes {
+    game: Vec<Target>,
+    voice: Vec<Target>,
+    media: Vec<Target>,
+}
+
+/// Decides what is recorded. An app is **muted** (captured nowhere, so it is not in the Mix
+/// either) when it is parked as not recorded or sits on a track that is switched off. The
+/// rest go to their track, once: an app listed twice stays on the first of Game, Voice, Media.
+/// `foreground` is the full-screen app (pid, exe) that an empty Game list stands for.
+fn route(s: &crate::config::AudioSettings, foreground: Option<(u32, String)>) -> Routes {
+    let t = &s.tracks;
+    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let mut muted: Vec<&str> = s.ignored.iter().map(String::as_str).collect();
+    for (on, list) in [(t.game, &s.game), (t.voice, &s.voice), (t.media, &s.media)] {
+        if !on {
+            muted.extend(list.iter().map(String::as_str));
+        }
+    }
+    let is_muted = |n: &str| muted.iter().any(|m| eq(m, n));
+    let mut claimed: Vec<String> = Vec::new();
+    let take = |on: bool, list: &[String], claimed: &mut Vec<String>| -> Vec<Target> {
+        let mut out = Vec::new();
+        if on {
+            for n in list.iter().filter(|n| !is_muted(n)) {
+                if !claimed.iter().any(|c| eq(c, n)) {
+                    claimed.push(n.clone());
+                    out.push(Target::Exe(n.clone()));
+                }
+            }
+        }
+        out
+    };
+    let mut game = take(t.game, &s.game, &mut claimed);
+    if t.game
+        && s.game.is_empty()
+        && let Some((pid, exe)) = foreground
+        && !is_muted(&exe)
+    {
+        // pid 0 = a chosen app that is not running yet: follow it by name
+        game.push(if pid == 0 { Target::Exe(exe.clone()) } else { Target::Pid(pid) });
+        claimed.push(exe);
+    }
+    let voice = take(t.voice, &s.voice, &mut claimed);
+    let media = take(t.media, &s.media, &mut claimed);
+    Routes { game, voice, media }
+}
+
+/// The apps to capture for each track that has a stream, from the current settings. Tracks
+/// that were off when capture started have no stream and stay without sources.
+fn live_targets(
+    s: &crate::config::AudioSettings,
+    foreground: Option<(u32, String)>,
+    tracks: &[TrackKind],
+    written: &[bool],
+) -> Vec<(usize, Vec<Target>)> {
+    let r = route(s, foreground);
+    [
+        (TrackKind::Game, r.game),
+        (TrackKind::Voice, r.voice),
+        (TrackKind::Media, r.media),
+    ]
+    .into_iter()
+    .filter_map(|(kind, targets)| {
+        let i = tracks.iter().position(|t| *t == kind)?;
+        written.get(i).copied()?.then_some((i, targets))
+    })
+    .collect()
 }
 
 /// Executable name without `.exe` of the foreground fullscreen app, for clip folders
 /// (plan §6.2); `None` on the desktop.
 pub fn foreground_app_name() -> Option<String> {
-    let pid = foreground_fullscreen_pid()?;
-    let exe = processes().into_iter().find(|p| p.pid == pid)?.exe;
+    let exe = match crate::targets::active_app() {
+        Some(exe) => exe, // recording one application: its name, full screen or not
+        None => {
+            let pid = foreground_fullscreen_pid()?;
+            processes().into_iter().find(|p| p.pid == pid)?.exe
+        }
+    };
     let stem = exe
         .strip_suffix(".exe")
         .or_else(|| exe.strip_suffix(".EXE"))
@@ -286,11 +521,30 @@ pub fn foreground_app_name() -> Option<String> {
     (!stem.is_empty()).then(|| stem.to_owned())
 }
 
+/// Exe name (with `.exe`) of the full-screen app in front, for the status bar. The desktop
+/// shell covers the screen too, so it is not a game.
+pub fn foreground_game_exe() -> Option<String> {
+    let pid = foreground_fullscreen_pid()?;
+    let exe = processes().into_iter().find(|p| p.pid == pid)?.exe;
+    const SHELL: [&str; 4] = [
+        "explorer.exe",
+        "searchhost.exe",
+        "shellexperiencehost.exe",
+        "applicationframehost.exe",
+    ];
+    (!exe.is_empty() && !SHELL.iter().any(|s| exe.eq_ignore_ascii_case(s))).then_some(exe)
+}
+
 #[derive(Debug, Clone)]
 struct Proc {
     pid: u32,
     parent: u32,
     exe: String,
+}
+
+/// (pid, exe name) of every running process.
+pub fn process_list() -> Vec<(u32, String)> {
+    processes().into_iter().map(|p| (p.pid, p.exe)).collect()
 }
 
 fn processes() -> Vec<Proc> {
@@ -317,6 +571,39 @@ fn processes() -> Vec<Proc> {
         let _ = CloseHandle(snap);
     }
     list
+}
+
+/// One source per process tree. Loopback of a process includes its children, so a process
+/// that sits under another wanted one, or is wanted by two tracks, would be heard twice in
+/// the Mix. The first track wins a shared process; an ancestor wins over its descendants.
+fn dedupe_wanted(wanted: Vec<(usize, u32)>, procs: &[Proc]) -> Vec<(usize, u32)> {
+    let parent: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.parent)).collect();
+    let all: Vec<u32> = wanted.iter().map(|w| w.1).collect();
+    let under_another = |pid: u32| {
+        let mut cur = parent.get(&pid).copied();
+        for _ in 0..64 {
+            match cur {
+                Some(p) if p != 0 && p != pid => {
+                    if all.contains(&p) {
+                        return true;
+                    }
+                    cur = parent.get(&p).copied();
+                }
+                _ => return false,
+            }
+        }
+        false
+    };
+    let mut seen = Vec::new();
+    wanted
+        .into_iter()
+        .filter(|&(_, pid)| {
+            !under_another(pid) && !seen.contains(&pid) && {
+                seen.push(pid);
+                true
+            }
+        })
+        .collect()
 }
 
 /// PIDs to loop back for `targets`: explicit PIDs, plus each *root* process of a named
@@ -391,9 +678,27 @@ fn default_endpoint(loopback: bool) -> Result<IMMDevice> {
     }
 }
 
-/// ID of the current default device (render for loopback, else capture).
-fn default_endpoint_id(loopback: bool) -> Result<String> {
-    let dev = default_endpoint(loopback)?;
+/// The chosen capture device if it is plugged in and active, else the system default. Only
+/// microphones are chosen: loopback always follows the default playback device.
+fn endpoint_for(loopback: bool, selected: Option<&str>) -> Result<IMMDevice> {
+    if !loopback && let Some(id) = selected.filter(|s| !s.is_empty()) {
+        let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: COM calls on interfaces we own; `wide` outlives GetDevice.
+        unsafe {
+            if let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                && let Ok(dev) = en.GetDevice(PCWSTR(wide.as_ptr()))
+                && dev.GetState().is_ok_and(|s| s == DEVICE_STATE_ACTIVE)
+            {
+                return Ok(dev);
+            }
+        }
+    }
+    default_endpoint(loopback)
+}
+
+/// ID of the device capture should use now (see `endpoint_for`).
+fn default_endpoint_id(loopback: bool, selected: Option<&str>) -> Result<String> {
+    let dev = endpoint_for(loopback, selected)?;
     // SAFETY: GetId returns a CoTaskMem string that we free after copying it.
     unsafe {
         let id = dev.GetId()?;
@@ -403,8 +708,8 @@ fn default_endpoint_id(loopback: bool) -> Result<String> {
     }
 }
 
-fn endpoint_client(loopback: bool) -> Result<(IAudioClient, String)> {
-    let dev = default_endpoint(loopback)?;
+fn endpoint_client(loopback: bool, selected: Option<&str>) -> Result<(IAudioClient, String)> {
+    let dev = endpoint_for(loopback, selected)?;
     // SAFETY: GetId's CoTaskMem string is freed after copying; activation on a live device.
     unsafe {
         let raw = dev.GetId()?;
@@ -647,8 +952,14 @@ pub struct AudioPath {
 
 struct Mixer {
     tracks: Vec<TrackKind>,
-    encoders: Vec<AudioEncoder>,
-    first_stream: u8,
+    /// One per track; `None` = the track is not written (its sound still feeds the Mix).
+    encoders: Vec<Option<AudioEncoder>>,
+    /// Muxer stream index per track (meaningful where the encoder is `Some`).
+    stream_ix: Vec<u8>,
+    frame: usize,
+    /// Live mute switches and each track's current level (faded between 0 and 1).
+    live: Arc<LiveTracks>,
+    gains: Vec<f32>,
     timeline: Timeline,
     /// line index -> track index
     line_track: Vec<usize>,
@@ -658,6 +969,9 @@ struct Mixer {
     /// Wanted endpoint sources: (track, loopback).
     endpoints: Vec<(usize, bool)>,
     targets: Vec<(usize, Vec<Target>)>,
+    /// Sticky foreground app (see `AudioOptions::foreground`) and the routing revision applied.
+    foreground: Option<(u32, String)>,
+    routes_rev: u64,
     chunk_tx: Sender<Chunk>,
     stats: AudioStats,
 }
@@ -684,35 +998,70 @@ impl AudioPath {
         } else {
             vec![TrackKind::Mix, TrackKind::Mic, TrackKind::Desktop]
         };
+        let written = |t: &TrackKind| match t {
+            TrackKind::Mix => opts.mix,
+            TrackKind::Mic => opts.mic,
+            TrackKind::Game => opts.track_game,
+            TrackKind::Voice => opts.track_voice,
+            TrackKind::Media => opts.track_media,
+            TrackKind::Desktop => true,
+        };
         let encoders = tracks
             .iter()
-            .map(|_| AudioEncoder::open(opts.codec, origin_us).map_err(AudioError::from))
-            .collect::<Result<Vec<_>>>()?;
-        let streams = tracks
-            .iter()
-            .zip(&encoders)
-            .map(|(t, e)| {
-                Ok(AudioStream {
-                    title: t.title(),
-                    params: Arc::new(e.stream_params()?),
-                    default: *t == TrackKind::Mix,
-                })
+            .map(|t| {
+                written(t)
+                    .then(|| AudioEncoder::open(opts.codec, origin_us).map_err(AudioError::from))
+                    .transpose()
             })
             .collect::<Result<Vec<_>>>()?;
+        let is_written: Vec<bool> = encoders.iter().map(Option::is_some).collect();
+        let mut stream_ix = Vec::with_capacity(tracks.len());
+        let mut streams = Vec::new();
+        for (t, e) in tracks.iter().zip(&encoders) {
+            stream_ix.push(first_stream + streams.len() as u8);
+            if let Some(e) = e {
+                streams.push(AudioStream {
+                    title: t.title(),
+                    params: Arc::new(e.stream_params()?),
+                    default: false,
+                });
+            }
+        }
+        // The Mix plays by default; without it, the first written track does.
+        let default_ix = tracks
+            .iter()
+            .zip(&is_written)
+            .filter(|(_, w)| **w)
+            .position(|(t, _)| *t == TrackKind::Mix)
+            .or((!streams.is_empty()).then_some(0));
+        if let Some(i) = default_ix {
+            streams[i].default = true;
+        }
+        let frame = encoders.iter().flatten().next().map_or(1024, |e| e.frame_size);
 
         let mut mixer = Mixer {
             tracks: tracks.clone(),
             encoders,
-            first_stream,
+            stream_ix,
+            frame,
+            live: opts.live.clone(),
+            gains: vec![1.0; tracks.len()],
             timeline: Timeline::new(origin_us),
             line_track: Vec::new(),
             sources: Vec::new(),
             free_lines: Vec::new(),
             endpoints: Vec::new(),
             targets: Vec::new(),
+            foreground: opts.foreground.clone(),
+            routes_rev: opts.live.routes_rev(),
             chunk_tx,
             stats: AudioStats {
-                tracks: tracks.iter().map(|t| t.title()).collect(),
+                tracks: tracks
+                    .iter()
+                    .zip(&is_written)
+                    .filter(|(_, w)| **w)
+                    .map(|(t, _)| t.title())
+                    .collect(),
                 process_loopback,
                 ..Default::default()
             },
@@ -729,7 +1078,8 @@ impl AudioPath {
             (TrackKind::Voice, &opts.voice),
             (TrackKind::Media, &opts.media),
         ] {
-            if let Some(ti) = idx(kind) {
+            // A track that is off opens no sources at all, so its apps are not in the Mix.
+            if let Some(ti) = idx(kind).filter(|_| written(&kind)) {
                 mixer.targets.push((ti, targets.clone()));
             }
         }
@@ -817,8 +1167,10 @@ impl Mixer {
             self.free_lines.push(s.line);
         }
 
+        let mic = self.live.mic_device();
         for (ti, loopback) in self.endpoints.clone() {
-            let want = default_endpoint_id(loopback).ok();
+            let chosen = if loopback { None } else { mic.as_deref() };
+            let want = default_endpoint_id(loopback, chosen).ok();
             let current = self.live(|k| matches!(k, SourceKey::Endpoint { loopback: l, .. } if *l == loopback));
             if let Some(i) = current {
                 if let SourceKey::Endpoint { id, .. } = &self.sources[i].key
@@ -829,7 +1181,7 @@ impl Mixer {
                 self.sources[i].stop.store(true, Ordering::Release); // reaped on a later rescan
             }
             if want.is_some()
-                && let Ok((client, id)) = endpoint_client(loopback)
+                && let Ok((client, id)) = endpoint_client(loopback, chosen)
                 && self
                     .start_source(client, SourceKey::Endpoint { loopback, id }, ti)
                     .is_ok()
@@ -840,12 +1192,16 @@ impl Mixer {
 
         let procs = processes();
         let me = std::process::id();
-        let mut wanted = Vec::new();
+        let mut pairs = Vec::new();
         for (ti, targets) in &self.targets {
             for pid in resolve(targets, &procs).into_iter().filter(|&p| p != me) {
-                wanted.push(SourceKey::Process { track: *ti, pid });
+                pairs.push((*ti, pid));
             }
         }
+        let wanted: Vec<SourceKey> = dedupe_wanted(pairs, &procs)
+            .into_iter()
+            .map(|(track, pid)| SourceKey::Process { track, pid })
+            .collect();
         // Process gone (or no longer a target root): stop its source.
         for s in &self.sources {
             if matches!(s.key, SourceKey::Process { .. }) && !wanted.contains(&s.key) {
@@ -867,9 +1223,17 @@ impl Mixer {
         self.stats.lines = self.timeline.lines();
     }
 
+    /// Take the apps per track from the latest settings. `rescan` then stops the sources that
+    /// no longer belong and starts the ones that now do.
+    fn apply_routes(&mut self) {
+        let Some(s) = self.live.settings() else { return };
+        let written: Vec<bool> = self.encoders.iter().map(Option::is_some).collect();
+        self.targets = live_targets(&s, self.foreground.clone(), &self.tracks, &written);
+    }
+
     fn run(mut self, rx: Receiver<Chunk>, out: Sender<Packet>, stop: Arc<AtomicBool>) -> Result<AudioStats> {
         capture::com_init();
-        let frame = self.encoders[0].frame_size;
+        let frame = self.frame;
         let mut last_scan = Instant::now();
         let mut packets = Vec::new();
         loop {
@@ -894,7 +1258,14 @@ impl Mixer {
             if stopping {
                 break;
             }
-            if last_scan.elapsed() >= RESCAN_EVERY {
+            let rev = self.live.routes_rev();
+            if rev != self.routes_rev {
+                // Apps moved, parked or released: re-route now instead of waiting for the next scan.
+                self.routes_rev = rev;
+                self.apply_routes();
+                self.rescan();
+                last_scan = Instant::now();
+            } else if last_scan.elapsed() >= RESCAN_EVERY {
                 self.rescan();
                 last_scan = Instant::now();
             }
@@ -906,7 +1277,9 @@ impl Mixer {
             let _ = s.thread.join();
         }
         for (i, e) in self.encoders.iter_mut().enumerate() {
-            e.flush(self.first_stream + i as u8, &mut packets)?;
+            if let Some(e) = e {
+                e.flush(self.stream_ix[i], &mut packets)?;
+            }
         }
         for p in packets.drain(..) {
             let _ = out.send(p);
@@ -927,6 +1300,13 @@ impl Mixer {
                 *d += s;
             }
         }
+        // Live mute: fade each track to silent (or back) before the Mix is summed from them,
+        // so a muted app is gone from its own track and from the Mix.
+        for (i, kind) in self.tracks.iter().enumerate() {
+            if !matches!(kind, TrackKind::Mix | TrackKind::Desktop) {
+                ramp(&mut tracks[i], &mut self.gains[i], f32::from(self.live.audible(*kind)));
+            }
+        }
         if let Some(mix_i) = self.tracks.iter().position(|t| *t == TrackKind::Mix) {
             let mut mix = vec![0.0f32; n];
             for (_, t) in tracks.iter().enumerate().filter(|(i, _)| *i != mix_i) {
@@ -935,10 +1315,17 @@ impl Mixer {
                 }
             }
             mix.iter_mut().for_each(|s| *s = soft_limit(*s));
+            ramp(
+                &mut mix,
+                &mut self.gains[mix_i],
+                f32::from(self.live.audible(TrackKind::Mix)),
+            );
             tracks[mix_i] = mix;
         }
         for (i, (enc, samples)) in self.encoders.iter_mut().zip(&tracks).enumerate() {
-            enc.encode(samples, pos, self.first_stream + i as u8, out)?;
+            if let Some(enc) = enc {
+                enc.encode(samples, pos, self.stream_ix[i], out)?;
+            }
         }
         self.stats.frames_per_track += 1;
         Ok(())
@@ -1059,6 +1446,213 @@ mod tests {
             assert!(soft_limit(x).abs() <= 1.0);
         }
         assert!(soft_limit(0.9) > soft_limit(0.85));
+    }
+
+    /// Real stack: a chosen input is used; a missing one falls back to the default input.
+    #[test]
+    fn chosen_microphone_is_used_and_a_missing_one_falls_back() {
+        capture::com_init();
+        let Ok(default) = default_endpoint_id(false, None) else {
+            return; // no input device on this machine
+        };
+        let devices = crate::apps::input_devices();
+        if let Some(other) = devices.iter().find(|d| d.id != default) {
+            assert_eq!(default_endpoint_id(false, Some(&other.id)).unwrap(), other.id);
+        }
+        let gone = "{0.0.1.00000000}.{00000000-0000-0000-0000-000000000000}";
+        assert_eq!(default_endpoint_id(false, Some(gone)).unwrap(), default);
+        // loopback ignores the choice: it always follows the default playback device
+        if let (Ok(a), Ok(b)) = (default_endpoint_id(true, None), default_endpoint_id(true, Some(gone))) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn ramp_fades_to_exact_silence_and_back() {
+        let mut gain = 1.0;
+        let mut a = vec![1.0f32; 8]; // 4 stereo frames
+        ramp(&mut a, &mut gain, 0.0);
+        assert_eq!(gain, 0.0);
+        assert!(a.windows(2).all(|w| w[1] <= w[0]), "monotonic fade");
+        assert_eq!((a[0], a[1]), (0.75, 0.75));
+        assert_eq!((a[6], a[7]), (0.0, 0.0));
+        // settled at 0: whatever arrives is silenced exactly
+        let mut b = vec![0.5f32; 8];
+        ramp(&mut b, &mut gain, 0.0);
+        assert!(b.iter().all(|&x| x == 0.0));
+        // and back up to 1
+        let mut c = vec![1.0f32; 8];
+        ramp(&mut c, &mut gain, 1.0);
+        assert_eq!((c[0], c[7]), (0.25, 1.0));
+        // unity is untouched
+        let mut d = vec![0.3f32; 8];
+        ramp(&mut d, &mut gain, 1.0);
+        assert!(d.iter().all(|&x| x == 0.3));
+    }
+
+    #[test]
+    fn live_switches_follow_settings_and_never_mute_the_desktop_fallback() {
+        let live = LiveTracks::new();
+        assert!(live.audible(TrackKind::Voice));
+        let s = settings(|s| {
+            s.tracks.voice = false;
+            s.mic = false;
+        });
+        live.apply(&s);
+        assert!(!live.audible(TrackKind::Voice));
+        assert!(!live.audible(TrackKind::Mic));
+        assert!(live.audible(TrackKind::Game) && live.audible(TrackKind::Mix));
+        assert!(live.audible(TrackKind::Desktop));
+        live.set(TrackKind::Voice, true);
+        assert!(live.audible(TrackKind::Voice));
+    }
+
+    fn settings(f: impl FnOnce(&mut crate::config::AudioSettings)) -> crate::config::AudioSettings {
+        let mut s = crate::config::AudioSettings {
+            game: vec!["game.exe".into()],
+            voice: vec!["discord.exe".into()],
+            media: vec!["spotify.exe".into(), "chrome.exe".into()],
+            ..Default::default()
+        };
+        f(&mut s);
+        s
+    }
+    fn exes(names: &[&str]) -> Vec<Target> {
+        names.iter().map(|n| Target::Exe((*n).into())).collect()
+    }
+
+    #[test]
+    fn live_targets_follow_moved_apps_and_skip_tracks_without_a_stream() {
+        use TrackKind::*;
+        let tracks = [Mix, Mic, Game, Voice, Media];
+        let written = [true, true, true, true, false]; // Media was off at start: no stream
+        let t = live_targets(&settings(|_| {}), None, &tracks, &written);
+        assert_eq!(t, vec![(2, exes(&["game.exe"])), (3, exes(&["discord.exe"]))]);
+        // discord.exe moved from Voice to Game: it now feeds the Game track.
+        let moved = settings(|s| {
+            s.voice.clear();
+            s.game.push("discord.exe".into());
+        });
+        let t = live_targets(&moved, None, &tracks, &written);
+        assert_eq!(t, vec![(2, exes(&["game.exe", "discord.exe"])), (3, vec![])]);
+        // Parked apps are captured nowhere.
+        let parked = settings(|s| s.ignored = vec!["game.exe".into()]);
+        assert_eq!(live_targets(&parked, None, &tracks, &written)[0], (2, vec![]));
+    }
+
+    #[test]
+    fn live_targets_keep_the_game_found_at_start_when_the_list_is_empty() {
+        use TrackKind::*;
+        let tracks = [Mix, Mic, Game, Voice, Media];
+        let all = [true; 5];
+        let s = settings(|s| s.game.clear());
+        let t = live_targets(&s, Some((4242, "halo.exe".into())), &tracks, &all);
+        assert_eq!(t[0], (2, vec![Target::Pid(4242)]));
+        // Without the remembered app (the settings window in front), nothing would be left.
+        assert_eq!(live_targets(&s, None, &tracks, &all)[0], (2, vec![]));
+    }
+
+    #[test]
+    fn changing_routes_bumps_the_revision_but_mic_or_identical_settings_do_not() {
+        let live = LiveTracks::new();
+        let base = settings(|_| {});
+        live.remember(&base);
+        let r0 = live.routes_rev();
+        live.apply(&base);
+        assert_eq!(live.routes_rev(), r0, "same routing: nothing to redo");
+        live.apply(&settings(|s| s.mic_device = Some("x".into())));
+        assert_eq!(live.routes_rev(), r0, "a microphone switch is not a re-route");
+        live.apply(&settings(|s| s.media.push("vlc.exe".into())));
+        assert_eq!(live.routes_rev(), r0 + 1);
+        live.apply(&settings(|s| s.tracks.voice = false));
+        assert_eq!(live.routes_rev(), r0 + 2);
+    }
+
+    #[test]
+    fn route_sends_each_app_to_its_track() {
+        let r = route(&settings(|_| {}), None);
+        assert_eq!(r.game, exes(&["game.exe"]));
+        assert_eq!(r.voice, exes(&["discord.exe"]));
+        assert_eq!(r.media, exes(&["spotify.exe", "chrome.exe"]));
+    }
+
+    #[test]
+    fn a_track_that_is_off_mutes_its_apps_entirely() {
+        let r = route(&settings(|s| s.tracks.voice = false), None);
+        assert!(r.voice.is_empty());
+        // ...and they are not smuggled in through another track
+        let r = route(
+            &settings(|s| {
+                s.tracks.voice = false;
+                s.media.push("discord.exe".into());
+            }),
+            None,
+        );
+        assert!(r.voice.is_empty());
+        assert_eq!(r.media, exes(&["spotify.exe", "chrome.exe"]));
+    }
+
+    #[test]
+    fn parked_apps_are_recorded_nowhere() {
+        let r = route(
+            &settings(|s| {
+                s.ignored = vec!["Chrome.EXE".into(), "game.exe".into()];
+            }),
+            None,
+        );
+        assert!(r.game.is_empty());
+        assert_eq!(r.media, exes(&["spotify.exe"]));
+    }
+
+    #[test]
+    fn an_empty_game_list_follows_the_foreground_app_unless_muted() {
+        let fg = || Some((42, "eldenring.exe".to_string()));
+        let open = settings(|s| s.game.clear());
+        assert_eq!(route(&open, fg()).game, vec![Target::Pid(42)]);
+        let off = settings(|s| {
+            s.game.clear();
+            s.tracks.game = false;
+        });
+        assert!(route(&off, fg()).game.is_empty());
+        let parked = settings(|s| {
+            s.game.clear();
+            s.ignored = vec!["eldenring.exe".into()];
+        });
+        assert!(route(&parked, fg()).game.is_empty());
+    }
+
+    #[test]
+    fn an_app_listed_twice_is_captured_once() {
+        let r = route(&settings(|s| s.media.push("game.exe".into())), None);
+        assert_eq!(r.game, exes(&["game.exe"]));
+        assert_eq!(r.media, exes(&["spotify.exe", "chrome.exe"]));
+        // the foreground app is already claimed by an entry of the same name
+        let fg = Some((7, "chrome.exe".to_string()));
+        let r = route(&settings(|s| s.game.clear()), fg);
+        assert_eq!(r.game, vec![Target::Pid(7)]);
+        assert_eq!(r.media, exes(&["spotify.exe"]));
+    }
+
+    #[test]
+    fn dedupe_keeps_one_source_per_process_tree() {
+        let p = |pid, parent, exe: &str| Proc {
+            pid,
+            parent,
+            exe: exe.into(),
+        };
+        let procs = vec![
+            p(1, 0, "explorer.exe"),
+            p(10, 1, "launcher.exe"),
+            p(11, 10, "game.exe"),
+            p(20, 1, "x.exe"),
+        ];
+        // game (track 0) sits under the launcher (track 2): the launcher's tree already has it
+        assert_eq!(
+            dedupe_wanted(vec![(0, 11), (2, 10), (1, 20)], &procs),
+            vec![(2, 10), (1, 20)]
+        );
+        // one process wanted by two tracks: the first track keeps it
+        assert_eq!(dedupe_wanted(vec![(0, 20), (2, 20)], &procs), vec![(0, 20)]);
     }
 
     #[test]

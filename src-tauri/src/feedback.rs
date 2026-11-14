@@ -62,11 +62,21 @@ pub fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
-pub fn clip_saved(app: &AppHandle, settings: &Settings, name: &str, secs: f64) {
+/// `toast_ok` is false when the badge already announced the clip.
+pub fn clip_saved(app: &AppHandle, settings: &Settings, name: &str, secs: f64, toast_ok: bool) {
+    if settings.save_sound {
+        play_chime();
+    }
+    if settings.save_toast && toast_ok {
+        notify(app, &format!("Clip saved ({secs:.0} s)"), name);
+    }
+}
+
+pub fn screenshot_saved(app: &AppHandle, settings: &Settings, name: &str) {
     if settings.save_sound {
         play_chime();
     }
     if settings.save_toast {
-        notify(app, &format!("Clip saved ({secs:.0} s)"), name);
+        notify(app, "Screenshot saved", name);
     }
 }

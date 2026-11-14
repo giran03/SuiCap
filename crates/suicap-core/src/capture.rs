@@ -443,12 +443,25 @@ const WGC_BUFFERS: i32 = 2;
 
 impl WgcSource {
     pub fn for_monitor(device: &ID3D11Device, output: &Output, cursor: bool) -> Result<Self> {
-        let dxgi: IDXGIDevice = device.cast()?;
-        // SAFETY: wraps our live DXGI device in a WinRT IDirect3DDevice.
-        let d3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
         // SAFETY: HMONITOR comes from DXGI for an attached output.
         let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(output.monitor)? };
+        Self::from_item(device, item, cursor)
+    }
+
+    /// One application window (`hwnd` from `targets`). Fails if it is gone or cannot be captured.
+    pub fn for_window(device: &ID3D11Device, hwnd: isize, cursor: bool) -> Result<Self> {
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+        // SAFETY: a stale handle just makes CreateForWindow fail.
+        let item: GraphicsCaptureItem =
+            unsafe { interop.CreateForWindow(windows::Win32::Foundation::HWND(hwnd as *mut _))? };
+        Self::from_item(device, item, cursor)
+    }
+
+    fn from_item(device: &ID3D11Device, item: GraphicsCaptureItem, cursor: bool) -> Result<Self> {
+        let dxgi: IDXGIDevice = device.cast()?;
+        // SAFETY: wraps our live DXGI device in a WinRT IDirect3DDevice.
+        let d3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
         let closed = Arc::new(AtomicBool::new(false));
         let flag = closed.clone();
         item.Closed(&TypedEventHandler::new(move |_, _| {
