@@ -117,7 +117,6 @@ fn main() {
             commands::reveal_app,
             commands::present_apps,
             commands::open_settings,
-            commands::menu_ready,
             commands::quit,
             commands::codec_support,
             commands::badge_resize,

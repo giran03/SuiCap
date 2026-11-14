@@ -11,6 +11,7 @@
   import Seg from "./Seg.svelte";
   import SliderField from "./SliderField.svelte";
   import Select from "./Select.svelte";
+  import Rail from "./Rail.svelte";
   import TitleBar from "./TitleBar.svelte";
   import AppIcon from "./AppIcon.svelte";
   import { friendlyName, rememberNames } from "./icons";
@@ -33,6 +34,7 @@
   let saveError = $state("");
   let actionError = $state("");
   let settingsOpen = $state(false);
+  let dashEl = $state<HTMLElement>();
   let tab = $state<"general" | "appearance" | "updates" | "about">("general");
   const tabs = [
     { id: "general", label: "General", tile: "#8e8e93", icon: "M4 7h9M17 7h3M4 17h3M11 17h9M15 4v6M9 14v6" },
@@ -51,10 +53,10 @@
 
   const resolutions = [
     { w: 0, h: 0, label: "Monitor size" },
-    { w: 1280, h: 720, label: "1280 × 720" },
-    { w: 1920, h: 1080, label: "1920 × 1080" },
-    { w: 2560, h: 1440, label: "2560 × 1440" },
-    { w: 3840, h: 2160, label: "3840 × 2160" },
+    { w: 1280, h: 720, label: "1280 × 720", tag: "720p" },
+    { w: 1920, h: 1080, label: "1920 × 1080", tag: "1080p" },
+    { w: 2560, h: 1440, label: "2560 × 1440", tag: "1440p" },
+    { w: 3840, h: 2160, label: "3840 × 2160", tag: "4K" },
   ];
 
   const armed = $derived(status?.phase === "armed");
@@ -484,7 +486,7 @@
 
   onMount(() => {
     pollGame();
-    loadWindows();
+    if (src.kind === "app") loadWindows();
     const gameTimer = setInterval(pollGame, 3000);
     const winTimer = setInterval(() => !document.hidden && src.kind === "app" && loadWindows(), 4000);
     api.updateInfo().then((u) => (update = u));
@@ -518,46 +520,29 @@
 <svelte:window onkeydown={(e) => e.key === "Escape" && !e.defaultPrevented && settingsOpen && (settingsOpen = false)} />
 
 <div class="shell">
-  <div class="titlebar"><TitleBar /></div>
+  <Rail
+    scrollEl={dashEl}
+    {armed}
+    hasError={status?.phase === "error"}
+    {settingsOpen}
+    {upBadge}
+    onOpenSettings={() => (settingsOpen = true)}
+  />
 
-  <main class="dash" use:dragscroll>
-    {#if status?.settings_warning}
-      <p class="banner warn" transition:slide={{ duration: 260, easing: cubicOut }}>{status.settings_warning}</p>
-    {/if}
-    {#if pending}
-      <div class="banner confirm" role="alert" transition:slide={{ duration: 260, easing: cubicOut }}>
-        <span>These changes restart capture and clear the {Math.round(status?.buffered_secs ?? 0)} s in the replay buffer.</span>
-        <span class="inline">
-          <button class="btn ghost" onclick={undo}>Undo</button>
-          <button class="btn primary" onclick={persist}>Apply</button>
-        </span>
-      </div>
-    {/if}
-    {#each status?.notes ?? [] as note (note)}
-      <p class="banner info" transition:slide={{ duration: 260, easing: cubicOut }}>{note}</p>
-    {/each}
-    {#if saveError}
-      <p class="banner warn" role="alert" transition:slide={{ duration: 260, easing: cubicOut }}>Not saved: {saveError}</p>
-    {/if}
-    {#if actionError}
-      <p class="banner warn" role="alert" transition:slide={{ duration: 260, easing: cubicOut }}>{actionError}</p>
-    {/if}
-
-
-    <header class="top">
-      <div class="word">
-        <svg viewBox="0 0 256 256" aria-hidden="true"><path d="M48.3 36.0L76.3 52.17V203.83L48.3 220.0Z" fill="currentColor" /><path d="M88.3 59.09L116.3 75.26V180.74L88.3 196.91Z" fill="currentColor" /><path d="M128.3 82.19L156.3 98.35V157.65L128.3 173.81Z" fill="currentColor" /><path d="M168.3 105.28L207.7 128L168.3 150.72Z" fill="var(--accent)" /></svg>
-        suicap
-      </div>
+  <div class="main-col">
+    <header class="top" data-tauri-drag-region>
+      <div class="word" data-tauri-drag-region>SuiCap</div>
       <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="stats" oncontextmenu={replayMenu}>
+      <div class="stats" data-tauri-drag-region oncontextmenu={replayMenu}>
         {#if game}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <span class="stat game" class:capturing={capturing && src.exe.toLowerCase() === game.toLowerCase()} title={game} oncontextmenu={gameMenu} transition:scale={{ duration: 240, start: 0.8, easing: backOut }}>
             <AppIcon exe={game} size={18} />{friendlyName(game)}
             {#if capturing && src.exe.toLowerCase() === game.toLowerCase()}
               <em>Capturing</em>
-              <button class="pill-x" aria-label="Record the display instead" title="Record the display instead" onclick={() => setSource((x) => (x.kind = "display"))}>×</button>
+              <button class="pill-x" aria-label="Record the display instead" title="Record the display instead" onclick={() => setSource((x) => (x.kind = "display"))}>
+                <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" /></svg>
+              </button>
             {:else}
               <button class="pill-act" class:always={src.kind === "display"} onclick={() => recordOnly(game!)}>Record only this</button>
             {/if}
@@ -565,7 +550,9 @@
         {:else if capturing && src.exe}
           <span class="stat game capturing" title={src.exe} oncontextmenu={gameMenu}>
             <AppIcon exe={src.exe} size={18} />{friendlyName(src.exe)}<em>Capturing</em>
-            <button class="pill-x" aria-label="Record the display instead" title="Record the display instead" onclick={() => setSource((x) => (x.kind = "display"))}>×</button>
+            <button class="pill-x" aria-label="Record the display instead" title="Record the display instead" onclick={() => setSource((x) => (x.kind = "display"))}>
+              <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" /></svg>
+            </button>
           </span>
         {/if}
         <span class="stat" class:on={armed} class:err={status?.phase === "error"}><i class="dot"></i>{phaseText(status)}</span>
@@ -576,23 +563,35 @@
         {/if}
         <span class="stat">{s.audio.enabled ? "Audio on" : "Audio off"}</span>
       </div>
-      <div class="actions">
-        {#if running}
-          <button class="btn" onclick={() => act(api.disarm)}>Turn off</button>
-        {:else}
-          <button class="btn" onclick={() => act(api.arm)}>Turn on</button>
-        {/if}
-        <button class="btn primary" disabled={!armed} onclick={() => save(30)}>Save 30 s</button>
-        <button class="round" aria-label="Settings" title="Settings" onclick={() => (settingsOpen = true)}>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg>
-          {#if upBadge}<span class="pip" aria-label="Update available"></span>{/if}
-        </button>
-      </div>
+      <TitleBar />
     </header>
+
+    <main class="dash" bind:this={dashEl} use:dragscroll>
+      {#if status?.settings_warning}
+        <p class="banner warn" transition:slide={{ duration: 260, easing: cubicOut }}>{status.settings_warning}</p>
+      {/if}
+      {#if pending}
+        <div class="banner confirm" role="alert" transition:slide={{ duration: 260, easing: cubicOut }}>
+          <span>These changes restart capture and clear the {Math.round(status?.buffered_secs ?? 0)} s in the replay buffer.</span>
+          <span class="inline">
+            <button class="btn ghost" onclick={undo}>Undo</button>
+            <button class="btn primary" onclick={persist}>Apply</button>
+          </span>
+        </div>
+      {/if}
+      {#each status?.notes ?? [] as note (note)}
+        <p class="banner info" transition:slide={{ duration: 260, easing: cubicOut }}>{note}</p>
+      {/each}
+      {#if saveError}
+        <p class="banner warn" role="alert" transition:slide={{ duration: 260, easing: cubicOut }}>Not saved: {saveError}</p>
+      {/if}
+      {#if actionError}
+        <p class="banner warn" role="alert" transition:slide={{ duration: 260, easing: cubicOut }}>{actionError}</p>
+      {/if}
 
     <div class="grid">
       <div class="stack">
-      <section class="panel p-replay">
+      <section class="panel p-replay" id="replay">
         <div class="p-head"><h2>Replay</h2><span class="p-sub">Last {s.buffer_secs} s kept in memory</span></div>
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <section class="card status" class:on={armed} class:err={status?.phase === "error"} oncontextmenu={replayMenu}>
@@ -746,7 +745,7 @@
       </div>
 
       <div class="stack">
-      <section class="panel p-video">
+      <section class="panel p-video" id="video">
         <div class="p-head"><h2>Video</h2><span class="p-sub">{presets.find((x) => x.id === s.preset)?.name}</span></div>
           <div class="source">
             <div class="src-head"><span class="src-title">Source</span><span class="src-line" class:live={target?.kind === "window"}>{sourceLine}</span></div>
@@ -814,7 +813,7 @@
                 {@render row("Resolution", "Video is scaled on the GPU and letterboxed to keep its shape.")}
                 <Select
                   label="Resolution"
-                  options={resolutions.map((r) => ({ value: `${r.w}x${r.h}`, label: r.label }))}
+                  options={resolutions.map((r) => ({ value: `${r.w}x${r.h}`, label: r.label, tag: r.tag }))}
                   value={`${s.custom.width}x${s.custom.height}`}
                   onselect={(v) => {
                     const [w, h] = v.split("x").map(Number);
@@ -877,17 +876,18 @@
 
       </div>
 
-      <section class="panel p-audio">
+      <section class="panel p-audio" id="audio">
         <div class="p-head"><h2>Audio</h2><span class="p-sub">Tracks and app routing</span></div>
-        <AudioPage {s} {edit} />
+        <AudioPage {s} {status} {edit} />
       </section>
 
-      <section class="panel p-clips">
+      <section class="panel p-clips" id="clips">
         <div class="p-head"><h2>Clips</h2></div>
         <ClipsPage {s} {edit} />
       </section>
     </div>
   </main>
+  </div>
 </div>
 
 {#if settingsOpen}
@@ -905,9 +905,6 @@
         {/each}
       </nav>
       <div class="m-body" use:dragscroll>
-        <button class="m-close" aria-label="Close settings" onclick={() => (settingsOpen = false)}>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
-        </button>
         {#key tab}
           <div class="page">
             {#if tab === "general"}
@@ -921,6 +918,42 @@
             <div class="row">
               {@render row("Notification when a clip is saved", "Windows hides these while a game is full screen.")}
               <Toggle on={s.save_toast} label="Notification when a clip is saved" onchange={(v) => edit((d) => (d.save_toast = v))} />
+            </div>
+          </section>
+          <h2>Startup</h2>
+          <section class="card">
+            <div class="row">
+              {@render row("Start with Windows", "Opens in the tray, without this window.")}
+              <Toggle on={s.autostart} label="Start with Windows" onchange={(v) => edit((d) => (d.autostart = v))} />
+            </div>
+            <div class="row">
+              {@render row("Turn replay on at start", "")}
+              <Toggle on={s.arm_on_start} label="Turn replay on at start" onchange={(v) => edit((d) => (d.arm_on_start = v))} />
+            </div>
+          </section>
+          <h2>Data</h2>
+          <section class="card">
+            <div class="row">
+              {@render row("Clips folder", "Where saved clips go.")}
+              <button class="btn" onclick={() => act(api.openClipsFolder)}>Open</button>
+            </div>
+          </section>
+          <p class="foot">Closing the window keeps SuiCap running in the tray. Quit from the tray menu.</p>
+            {:else if tab === "appearance"}
+          <h1>Appearance</h1>
+          <section class="card">
+            <div class="row">
+              {@render row("Theme", "System follows your Windows setting.")}
+              <Seg
+                label="Theme"
+                options={[
+                  { value: "system", label: "System" },
+                  { value: "light", label: "Light" },
+                  { value: "dark", label: "Dark" },
+                ]}
+                value={s.theme}
+                onselect={(t) => edit((d) => (d.theme = t))}
+              />
             </div>
           </section>
           <h2>Recording badge</h2>
@@ -988,7 +1021,7 @@
                 </button>
               </div>
             </div>
-            <div class="row" class:dim={s.badge_icon !== "custom"}>
+            <div class="row">
               {@render row("Custom image", customIcon ? "Your image replaces the built-in icon. PNG, JPEG or WebP up to 1 MB; it keeps its own colors." : "Use your own image as the icon. PNG, JPEG or WebP up to 1 MB.")}
               <div class="custom-icon">
                 {#if customIcon}<img src={customIcon} alt="" draggable="false" />{/if}
@@ -1031,42 +1064,6 @@
               <button class="btn" onclick={resetBadgeStyle}>Reset to defaults</button>
             </div>
           </section>
-          <h2>Startup</h2>
-          <section class="card">
-            <div class="row">
-              {@render row("Start with Windows", "Opens in the tray, without this window.")}
-              <Toggle on={s.autostart} label="Start with Windows" onchange={(v) => edit((d) => (d.autostart = v))} />
-            </div>
-            <div class="row">
-              {@render row("Turn replay on at start", "")}
-              <Toggle on={s.arm_on_start} label="Turn replay on at start" onchange={(v) => edit((d) => (d.arm_on_start = v))} />
-            </div>
-          </section>
-          <h2>Data</h2>
-          <section class="card">
-            <div class="row">
-              {@render row("Clips folder", "Where saved clips go.")}
-              <button class="btn" onclick={() => act(api.openClipsFolder)}>Open</button>
-            </div>
-          </section>
-          <p class="foot">Closing the window keeps SuiCap running in the tray. Quit from the tray menu.</p>
-            {:else if tab === "appearance"}
-          <h1>Appearance</h1>
-          <section class="card">
-            <div class="row">
-              {@render row("Theme", "System follows your Windows setting.")}
-              <Seg
-                label="Theme"
-                options={[
-                  { value: "system", label: "System" },
-                  { value: "light", label: "Light" },
-                  { value: "dark", label: "Dark" },
-                ]}
-                value={s.theme}
-                onselect={(t) => edit((d) => (d.theme = t))}
-              />
-            </div>
-          </section>
             {:else if tab === "updates"}
           <h1>Updates</h1>
           <section class="card status" class:on={upBadge} class:err={upState?.phase === "failed"}>
@@ -1105,7 +1102,6 @@
             </div>
             <div class="row">
               {@render row("Last checked", lastChecked)}
-              <button class="btn" onclick={() => act(() => api.openLink("releases"))}>Release notes</button>
             </div>
           </section>
           <h2>What's new</h2>
@@ -1171,7 +1167,8 @@
 <style>
   .shell {
     display: grid;
-    grid-template-rows: 44px 1fr;
+    grid-template-rows: 1fr;
+    grid-template-columns: 76px minmax(0, 1fr);
     height: 100vh;
   }
 
@@ -1334,7 +1331,6 @@
     padding: 18px 22px 8px;
     font-size: 13px;
     line-height: 1.55;
-    user-select: text;
   }
   .changelog h3 {
     margin: 0 0 4px;
@@ -1805,7 +1801,6 @@
     font-size: 12px;
     font-weight: 500;
     overflow-wrap: anywhere;
-    user-select: text;
   }
 
   /* ---- Controls ---- */
@@ -1932,7 +1927,6 @@
     padding: 11px 15px;
     border-radius: var(--radius-md);
     font-size: 13px;
-    user-select: text;
   }
   .banner.confirm {
     display: flex;
@@ -2035,45 +2029,15 @@
     overflow-y: auto;
     padding: 6px 28px 28px;
   }
-  .m-close {
-    position: sticky;
-    top: 10px;
-    z-index: 2;
-    float: right;
-    display: grid;
-    place-items: center;
-    width: 30px;
-    height: 30px;
-    margin-top: 8px;
-    padding: 0;
-    border: 0;
-    border-radius: 9px;
-    background: var(--surface-2);
-    color: var(--text-2);
-    cursor: pointer;
-    transition:
-      background var(--fast) var(--ease),
-      transform var(--med) var(--spring);
-  }
-  .m-close:hover {
-    background: var(--surface-3);
-    color: var(--text);
-  }
-  .m-close:active {
-    transform: scale(0.92);
-  }
-  .m-close svg {
-    width: 14px;
-    height: 14px;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 2.2;
-    stroke-linecap: round;
-  }
 
   /* ---- Dashboard: one screen, divided into panels ---- */
-  .titlebar {
+  .main-col {
     grid-row: 1;
+    grid-column: 2;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    min-width: 0;
+    min-height: 0;
   }
   .dash:global(.grabbing),
   .m-body:global(.grabbing) {
@@ -2081,7 +2045,6 @@
     user-select: none;
   }
   .dash {
-    grid-row: 2;
     min-width: 0;
     overflow-x: hidden;
     overflow-y: auto;
@@ -2091,19 +2054,15 @@
     display: flex;
     align-items: center;
     gap: 22px;
-    margin: 0 0 18px;
+    padding: 12px 10px 18px 28px;
+    user-select: none;
   }
   .word {
     display: flex;
     align-items: center;
-    gap: 12px;
-    font: 700 34px var(--font-display);
+    height: 42px;
+    font: 700 34px/1 var(--font-display);
     letter-spacing: -0.02em;
-  }
-  .word svg {
-    width: 34px;
-    height: 34px;
-    color: var(--text);
   }
   .stats {
     display: flex;
@@ -2177,10 +2136,16 @@
     border-radius: 50%;
     background: color-mix(in srgb, currentColor 18%, transparent);
     color: inherit;
-    font-size: 13px;
-    line-height: 1;
     cursor: pointer;
     transition: background var(--fast) var(--ease);
+  }
+  .pill-x svg {
+    width: 10px;
+    height: 10px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
   }
   .pill-x:hover {
     background: color-mix(in srgb, currentColor 32%, transparent);
@@ -2191,55 +2156,6 @@
     box-shadow: inset 0 0 0 1px var(--accent);
     color: var(--text);
   }
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .round {
-    position: relative;
-    display: grid;
-    place-items: center;
-    width: 36px;
-    height: 36px;
-    padding: 0;
-    border: 0;
-    border-radius: 12px;
-    background: var(--surface-2);
-    color: var(--text-2);
-    cursor: pointer;
-    transition:
-      background var(--fast) var(--ease),
-      color var(--fast) var(--ease),
-      transform var(--med) var(--spring);
-  }
-  .round:hover {
-    background: var(--surface-3);
-    color: var(--text);
-  }
-  .round:active {
-    transform: scale(0.92);
-  }
-  .round svg {
-    width: 18px;
-    height: 18px;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.8;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-  }
-  .pip {
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--accent);
-    box-shadow: 0 0 0 2px var(--surface-2);
-  }
-
   .grid {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 380px;
@@ -2247,6 +2163,7 @@
     align-items: stretch;
   }
   .panel {
+    scroll-margin-top: 12px;
     min-width: 0;
     padding: 18px 20px 20px;
     border-radius: 22px;

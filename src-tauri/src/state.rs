@@ -166,7 +166,11 @@ impl AppState {
         };
         tray::refresh(app, &snapshot);
         crate::badge::sync(app);
-        let _ = app.emit("status", &snapshot);
+        let has_ui = app.get_webview_window(crate::tray::SETTINGS).is_some();
+        let has_badge = app.get_webview_window(crate::badge::BADGE).is_some();
+        if has_ui || has_badge {
+            let _ = app.emit("status", &snapshot);
+        }
     }
 
     /// Start capture with the current settings. A session already running is kept.
@@ -178,11 +182,13 @@ impl AppState {
         drop(slot.take()); // a finished session: joins at once
         let s = self.settings();
         let codec = AudioCodec::for_extension(s.container.ext());
-        let audio = s.audio.enabled.then(|| AudioOptions::for_app(
+        let audio = s.audio.enabled.then(|| {
+            AudioOptions::for_app(
                 &s.audio,
                 codec,
                 (s.source.kind == suicap_core::config::SourceKind::App).then_some(s.source.exe.as_str()),
-            ));
+            )
+        });
         *lock(&self.live) = audio.as_ref().map(|a| a.live.clone());
         let audio_live = if audio.is_some() {
             AudioLive {
@@ -394,13 +400,17 @@ fn on_session_event(app: &AppHandle, e: SessionEvent) {
                 feedback::play_chime();
             }
         }
-        SessionEvent::ScreenshotSaved(path) => {
+        SessionEvent::ScreenshotTaken(path) => {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let _ = app.emit("screenshot_flash", ());
+            let announced = crate::badge::announces_clips(app);
+            feedback::screenshot_saved(app, &state.settings(), &name, !announced);
+        }
+        SessionEvent::ScreenshotSaved(path) => {
             let _ = app.emit("clip_saved", path.to_string_lossy());
-            feedback::screenshot_saved(app, &state.settings(), &name);
             enforce_quota(app, &state);
         }
         SessionEvent::ScreenshotFailed(msg) => {

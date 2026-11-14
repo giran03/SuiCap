@@ -1,9 +1,48 @@
-.docs/
+# Build output and dependencies
 /target/
-/vendor/
+/dist/
+/node_modules/
 /release/
+/src-tauri/gen/
+/vendor/
+
+# Local notes and tool state
+.docs/
+.claude/
+.suivelle/
+graphify-out/
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs and scratch
 *.log
 *.tmp
-/node_modules/
-/dist/
-/src-tauri/gen/
+*.bak
+*.orig
+npm-debug.log*
+.vite/
+ui/harness.html
+
+# Secrets and local settings
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+signing/
+settings.local.json
+
+# Test recordings and captures
+*.mkv
+*.mp4
+*.mov
+*.webm
+/clips/
+/scratch/
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store

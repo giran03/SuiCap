@@ -107,6 +107,14 @@ body {
   color: var(--text);
   -webkit-font-smoothing: antialiased;
   user-select: none;
+  -webkit-user-select: none;
+}
+
+input,
+textarea,
+[contenteditable] {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 body {

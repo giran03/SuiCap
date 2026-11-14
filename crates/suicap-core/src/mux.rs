@@ -63,6 +63,7 @@ impl MuxStream {
 
 pub struct Muxer {
     fmt: *mut ffi::AVFormatContext,
+    pkt: *mut ffi::AVPacket,
     /// Per-stream time base after the header (the muxer may change it).
     tb: Vec<ffi::AVRational>,
     rebase: Rebaser,
@@ -96,14 +97,23 @@ impl Muxer {
                 "avformat_alloc_output_context2",
                 ffi::avformat_alloc_output_context2(&mut fmt, ptr::null(), format.as_ptr(), ctmp.as_ptr()),
             )?;
+            let pkt = ffi::av_packet_alloc();
             let mut mux = Muxer {
                 fmt,
+                pkt,
                 tb: Vec::new(),
                 rebase: Rebaser::default(),
                 tmp,
                 path: path.to_path_buf(),
                 packets: 0,
             };
+            if pkt.is_null() {
+                return Err(MuxError::Ffmpeg {
+                    call: "av_packet_alloc",
+                    code: -1,
+                    msg: "NULL".into(),
+                });
+            }
             let mp4 = format == c"mp4";
             let mut created = Vec::with_capacity(streams.len());
             for desc in streams {
@@ -170,36 +180,26 @@ impl Muxer {
         let Some(&tb) = self.tb.get(usize::from(p.stream)) else {
             return Ok(()); // stream not part of this file
         };
-        // SAFETY: packet allocated here and handed to the muxer, which takes the ref.
+        // SAFETY: self.pkt is a reusable owned AVPacket; av_packet_unref always runs after the call.
         unsafe {
-            let mut pkt = ffi::av_packet_alloc();
-            if pkt.is_null() {
-                return Err(MuxError::Ffmpeg {
-                    call: "av_packet_alloc",
-                    code: -1,
-                    msg: "NULL".into(),
-                });
-            }
             let len = i32::try_from(p.data.len()).map_err(|_| MuxError::Ffmpeg {
                 call: "av_new_packet",
                 code: -1,
                 msg: "packet payload exceeds i32::MAX".into(),
             })?;
             let r = (|| {
-                check("av_new_packet", ffi::av_new_packet(pkt, len))?;
-                ptr::copy_nonoverlapping(p.data.as_ptr(), (*pkt).data, p.data.len());
-                (*pkt).pts = ffi::av_rescale_q(pts, US, tb);
-                (*pkt).dts = ffi::av_rescale_q(dts, US, tb);
-                (*pkt).stream_index = i32::from(p.stream);
-                if p.key {
-                    (*pkt).flags |= ffi::AV_PKT_FLAG_KEY;
-                }
+                check("av_new_packet", ffi::av_new_packet(self.pkt, len))?;
+                ptr::copy_nonoverlapping(p.data.as_ptr(), (*self.pkt).data, p.data.len());
+                (*self.pkt).pts = ffi::av_rescale_q(pts, US, tb);
+                (*self.pkt).dts = ffi::av_rescale_q(dts, US, tb);
+                (*self.pkt).stream_index = i32::from(p.stream);
+                (*self.pkt).flags = if p.key { ffi::AV_PKT_FLAG_KEY } else { 0 };
                 check(
                     "av_interleaved_write_frame",
-                    ffi::av_interleaved_write_frame(self.fmt, pkt),
+                    ffi::av_interleaved_write_frame(self.fmt, self.pkt),
                 )
             })();
-            ffi::av_packet_free(&mut pkt);
+            ffi::av_packet_unref(self.pkt);
             r?;
         }
         self.packets += 1;
@@ -238,6 +238,8 @@ impl Muxer {
 
 impl Drop for Muxer {
     fn drop(&mut self) {
+        // SAFETY: we own pkt; av_packet_free accepts NULL.
+        unsafe { ffi::av_packet_free(&mut self.pkt) };
         if !self.fmt.is_null() {
             // Not finished: close and discard the partial file.
             // SAFETY: single close guarded by the NULL check.
@@ -261,7 +263,7 @@ impl Rebaser {
             self.base_us = Some(p.pts_us);
         }
         let base = self.base_us?;
-        (p.pts_us >= base).then(|| (p.pts_us - base, p.dts_us - base))
+        (p.pts_us >= base).then(|| (p.pts_us - base, p.dts_us() - base))
     }
 }
 
@@ -868,13 +870,7 @@ mod tests {
     use bytes::Bytes;
 
     fn pkt(stream: u8, key: bool, pts_us: i64) -> Packet {
-        Packet {
-            stream,
-            key,
-            pts_us,
-            dts_us: pts_us,
-            data: Bytes::from_static(b"x"),
-        }
+        Packet::new(stream, key, pts_us, pts_us, Bytes::from_static(b"x"))
     }
 
     #[test]

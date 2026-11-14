@@ -1,0 +1,2672 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SuiCap — GPU Replay-Buffer Recorder for Windows</title>
+    <meta
+      name="description"
+      content="Always-on zero-copy GPU replay buffer for Windows. Save the last 10 seconds to 10 minutes on a hotkey with five isolated per-app audio tracks and zero game injection."
+    />
+    <meta property="og:title" content="SuiCap — Never miss the moment. Save it after it happens." />
+    <meta
+      property="og:description"
+      content="GPU replay-buffer recorder for Windows with AV1/HEVC/H.264 hardware encoding and 5-track per-app WASAPI audio isolation."
+    />
+    <meta property="og:image" content="media/suicap-showcase.gif" />
+    <link rel="icon" type="image/svg+xml" href="media/suicap-mark.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+        --font: "Geist", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+        --mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+
+        --canvas: #0e0f12;
+        --bg: #131417;
+        --sidebar: #17181c;
+        --surface: rgba(255, 255, 255, 0.048);
+        --surface-2: rgba(255, 255, 255, 0.072);
+        --surface-3: rgba(255, 255, 255, 0.11);
+        --surface-solid: #191b20;
+        --surface-elevated: #1f2229;
+        --line: rgba(255, 255, 255, 0.08);
+        --line-strong: rgba(255, 255, 255, 0.16);
+        --inner-highlight: rgba(255, 255, 255, 0.12);
+
+        --text: #f2f2f4;
+        --text-2: #a9b2c3;
+        --text-3: #788296;
+
+        --accent: #3ba7ff;
+        --accent-strong: #62b9ff;
+        --accent-soft: rgba(59, 167, 255, 0.16);
+        --on-accent: #06121d;
+
+        --rec: #ff453a;
+        --ok: #30d158;
+        --ok-soft: rgba(48, 209, 88, 0.16);
+        --warn: #ffb340;
+        --track-game: #ff9f0a;
+        --track-voice: #5e5ce6;
+        --track-media: #ff375f;
+        --track-muted: #8e8e93;
+
+        --shadow-card: 0 24px 60px rgba(0, 0, 0, 0.52);
+        --shadow-pill: 0 12px 32px rgba(0, 0, 0, 0.45);
+        --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+        --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+      }
+
+      html[data-theme="light"] {
+        color-scheme: light;
+        --canvas: #e6e9ef;
+        --bg: #eef0f4;
+        --sidebar: #f6f7f9;
+        --surface: rgba(255, 255, 255, 0.85);
+        --surface-2: rgba(15, 20, 30, 0.05);
+        --surface-3: rgba(15, 20, 30, 0.09);
+        --surface-solid: #ffffff;
+        --surface-elevated: #f1f3f7;
+        --line: rgba(15, 20, 30, 0.09);
+        --line-strong: rgba(15, 20, 30, 0.18);
+        --inner-highlight: rgba(255, 255, 255, 0.9);
+
+        --text: #111317;
+        --text-2: #4b5465;
+        --text-3: #687387;
+
+        --accent: #1b8ff0;
+        --accent-strong: #0a7bdc;
+        --accent-soft: rgba(27, 143, 240, 0.13);
+        --on-accent: #ffffff;
+
+        --rec: #e5362b;
+        --ok: #1b8c3d;
+        --ok-soft: rgba(31, 157, 70, 0.14);
+
+        --shadow-card: 0 24px 56px rgba(15, 20, 30, 0.12);
+        --shadow-pill: 0 12px 28px rgba(15, 20, 30, 0.12);
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        font-family: var(--font);
+        font-size: 16px;
+        line-height: 1.55;
+        color: var(--text);
+        background: var(--canvas);
+        -webkit-font-smoothing: antialiased;
+        overflow-x: hidden;
+      }
+
+      button,
+      input,
+      select {
+        font-family: inherit;
+      }
+
+      ::selection {
+        background: var(--accent);
+        color: var(--on-accent);
+      }
+
+      ::-webkit-scrollbar {
+        width: 10px;
+      }
+      ::-webkit-scrollbar-track {
+        background: var(--canvas);
+      }
+      ::-webkit-scrollbar-thumb {
+        border: 3px solid transparent;
+        border-radius: 6px;
+        background: var(--line-strong) padding-box;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: var(--text-3) padding-box;
+      }
+
+      :focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      .mono {
+        font-family: var(--mono);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .container {
+        width: 100%;
+        max-width: 1320px;
+        margin: 0 auto;
+        padding: 0 28px;
+      }
+
+      /* Double-Bezel Machined Architecture */
+      .bezel-outer {
+        padding: 6px;
+        border-radius: 24px;
+        background: var(--surface);
+        border: 1px solid var(--line-strong);
+        box-shadow: var(--shadow-card);
+      }
+
+      .bezel-inner {
+        border-radius: 18px;
+        background: var(--surface-solid);
+        border: 1px solid var(--line);
+        box-shadow: inset 0 1px 0 var(--inner-highlight);
+        overflow: hidden;
+      }
+
+      /* Ambient Canvas Backdrop */
+      .ambient-field {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 0;
+        background:
+          radial-gradient(960px 600px at 78% 10%, rgba(59, 167, 255, 0.1), transparent 70%),
+          radial-gradient(760px 520px at 14% 72%, rgba(59, 167, 255, 0.05), transparent 72%);
+      }
+
+      html[data-theme="light"] .ambient-field {
+        background:
+          radial-gradient(960px 600px at 78% 10%, rgba(27, 143, 240, 0.09), transparent 70%),
+          radial-gradient(760px 520px at 14% 72%, rgba(27, 143, 240, 0.04), transparent 72%);
+      }
+
+      main,
+      header,
+      footer {
+        position: relative;
+        z-index: 1;
+      }
+
+      /* Floating Pill Navigation */
+      .nav-wrap {
+        position: fixed;
+        top: 16px;
+        left: 0;
+        right: 0;
+        z-index: 40;
+        display: flex;
+        justify-content: center;
+        padding: 0 16px;
+        pointer-events: none;
+      }
+
+      .nav-pill {
+        pointer-events: auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        height: 60px;
+        padding: 6px 8px 6px 18px;
+        border-radius: 999px;
+        background: rgba(19, 20, 23, 0.82);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        border: 1px solid var(--line-strong);
+        box-shadow: var(--shadow-pill);
+        max-width: 1080px;
+        width: 100%;
+      }
+
+      html[data-theme="light"] .nav-pill {
+        background: rgba(246, 247, 249, 0.86);
+      }
+
+      @media (prefers-reduced-transparency: reduce) {
+        .nav-pill {
+          backdrop-filter: none;
+          background: var(--surface-solid);
+        }
+      }
+
+      .brand-link {
+        display: inline-flex;
+        align-items: center;
+        text-decoration: none;
+        flex-shrink: 0;
+      }
+
+      .brand-link img {
+        height: 30px;
+        width: auto;
+        display: block;
+      }
+
+      .brand-link .logo-light,
+      .footer-brand .logo-light {
+        display: none;
+      }
+
+      html[data-theme="light"] .brand-link .logo-dark,
+      html[data-theme="light"] .footer-brand .logo-dark {
+        display: none;
+      }
+      html[data-theme="light"] .brand-link .logo-light,
+      html[data-theme="light"] .footer-brand .logo-light {
+        display: block;
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .nav-links a {
+        color: var(--text-2);
+        text-decoration: none;
+        font-size: 14px;
+        font-weight: 500;
+        padding: 7px 12px;
+        border-radius: 999px;
+        white-space: nowrap;
+        transition:
+          color 160ms var(--ease-out),
+          background-color 160ms var(--ease-out);
+      }
+
+      @media (hover: hover) and (pointer: fine) {
+        .nav-links a:hover {
+          color: var(--text);
+          background: var(--surface-2);
+        }
+      }
+
+      .nav-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+      }
+
+      .theme-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 40px;
+        height: 40px;
+        border-radius: 999px;
+        border: 1px solid var(--line-strong);
+        background: var(--surface-2);
+        color: var(--text);
+        cursor: pointer;
+        transition:
+          background-color 160ms var(--ease-out),
+          transform 140ms var(--ease-out);
+      }
+
+      .theme-btn:active {
+        transform: scale(0.95);
+      }
+
+      /* Button-in-Button Primary CTA */
+      .btn-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        padding: 5px 5px 5px 20px;
+        height: 46px;
+        border-radius: 999px;
+        background: var(--accent);
+        color: var(--on-accent);
+        font-size: 14px;
+        font-weight: 700;
+        text-decoration: none;
+        border: 0;
+        cursor: pointer;
+        white-space: nowrap;
+        transition:
+          background-color 180ms var(--ease-out),
+          transform 140ms var(--ease-out);
+      }
+
+      .btn-pill:active {
+        transform: scale(0.97);
+      }
+
+      .btn-pill-sm {
+        height: 42px;
+        padding: 4px 4px 4px 16px;
+        gap: 10px;
+      }
+
+      .btn-pill-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 999px;
+        background: rgba(6, 18, 29, 0.16);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: transform 220ms var(--ease-out);
+      }
+
+      html[data-theme="light"] .btn-pill-icon {
+        background: rgba(255, 255, 255, 0.22);
+      }
+
+      @media (hover: hover) and (pointer: fine) {
+        .btn-pill:hover {
+          background: var(--accent-strong);
+        }
+        .btn-pill:hover .btn-pill-icon {
+          transform: translate(1px, -1px) scale(1.06);
+        }
+      }
+
+      .btn-ghost {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        height: 46px;
+        padding: 0 20px;
+        border-radius: 999px;
+        background: var(--surface-2);
+        border: 1px solid var(--line-strong);
+        color: var(--text);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+        cursor: pointer;
+        white-space: nowrap;
+        transition:
+          background-color 160ms var(--ease-out),
+          transform 140ms var(--ease-out);
+      }
+
+      .btn-ghost:active {
+        transform: scale(0.97);
+      }
+
+      @media (hover: hover) and (pointer: fine) {
+        .btn-ghost:hover {
+          background: var(--surface-3);
+        }
+      }
+
+      /* HERO SECTION */
+      .hero {
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        padding: 96px 0 56px;
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.25fr);
+        gap: 44px;
+        align-items: center;
+      }
+
+      .hero-copy {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 20px;
+      }
+
+      .hero-title {
+        margin: 0;
+        font-size: clamp(2.4rem, 4.1vw, 3.65rem);
+        font-weight: 800;
+        letter-spacing: -0.035em;
+        line-height: 1.05;
+        text-wrap: balance;
+      }
+
+      .hero-title .accent {
+        color: var(--accent);
+      }
+
+      .hero-sub {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.55;
+        color: var(--text-2);
+        max-width: 46ch;
+      }
+
+      .hero-ctas {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 12px;
+        margin-top: 4px;
+      }
+
+      .hero-facts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 6px;
+      }
+
+      .fact-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 13px;
+        border-radius: 999px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        color: var(--text-2);
+        font-size: 13px;
+        font-weight: 500;
+      }
+
+      .fact-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: var(--accent);
+      }
+
+      /* Hero Showcase Stage */
+      .stage-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--line);
+        background: var(--sidebar);
+      }
+
+      .seg-tabs {
+        display: inline-flex;
+        padding: 3px;
+        border-radius: 999px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        gap: 2px;
+      }
+
+      .seg-btn {
+        border: 0;
+        background: transparent;
+        color: var(--text-2);
+        font-family: var(--font);
+        font-size: 12.5px;
+        font-weight: 600;
+        padding: 6px 12px;
+        border-radius: 999px;
+        cursor: pointer;
+        white-space: nowrap;
+        transition:
+          background-color 160ms var(--ease-out),
+          color 160ms var(--ease-out);
+      }
+
+      .seg-btn[aria-selected="true"] {
+        background: var(--surface-elevated);
+        color: var(--text);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+      }
+
+      html[data-theme="light"] .seg-btn[aria-selected="true"] {
+        background: #ffffff;
+        box-shadow: 0 1px 4px rgba(15, 20, 30, 0.12);
+      }
+
+      .stage-meta {
+        font-size: 12px;
+        color: var(--text-3);
+        white-space: nowrap;
+      }
+
+      .stage-media {
+        position: relative;
+        aspect-ratio: 16 / 9;
+        background: #0e0f12;
+        overflow: hidden;
+      }
+
+      .stage-media img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: center top;
+        transition: opacity 220ms var(--ease-out);
+      }
+
+      /* SECTIONS SPACING & HEADINGS */
+      .section {
+        padding: 96px 0;
+      }
+
+      .section-head {
+        max-width: 68ch;
+        margin-bottom: 40px;
+      }
+
+      .section-head h2 {
+        margin: 0 0 12px;
+        font-size: clamp(1.85rem, 3vw, 2.55rem);
+        font-weight: 800;
+        letter-spacing: -0.03em;
+        line-height: 1.12;
+        text-wrap: balance;
+      }
+
+      .section-head p {
+        margin: 0;
+        font-size: 17px;
+        color: var(--text-2);
+        line-height: 1.58;
+      }
+
+      /* SECTION 2: INTERACTIVE REPLAY & RAM SIMULATOR */
+      .sim-grid {
+        display: grid;
+        grid-template-columns: 1.15fr 0.85fr;
+        gap: 24px;
+        padding: 28px;
+        align-items: stretch;
+      }
+
+      .sim-col {
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      .preset-row {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 10px;
+      }
+
+      .preset-card {
+        text-align: left;
+        padding: 14px;
+        border-radius: 14px;
+        background: var(--surface-2);
+        border: 1.5px solid var(--line);
+        color: var(--text);
+        cursor: pointer;
+        transition:
+          border-color 160ms var(--ease-out),
+          background-color 160ms var(--ease-out),
+          transform 130ms var(--ease-out);
+      }
+
+      .preset-card:active {
+        transform: scale(0.98);
+      }
+
+      .preset-card[aria-pressed="true"] {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+      }
+
+      .preset-name {
+        display: block;
+        font-size: 14px;
+        font-weight: 700;
+        margin-bottom: 4px;
+      }
+
+      .preset-desc {
+        display: block;
+        font-size: 12px;
+        line-height: 1.38;
+        color: var(--text-2);
+      }
+
+      .custom-controls {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 10px;
+        padding: 14px;
+        border-radius: 14px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+      }
+
+      .field-group {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .field-group label {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-2);
+      }
+
+      .field-select {
+        width: 100%;
+        padding: 8px 10px;
+        border-radius: 9px;
+        background: var(--surface-elevated);
+        border: 1px solid var(--line-strong);
+        color: var(--text);
+        font-family: var(--font);
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .slider-panel {
+        padding: 16px 18px;
+        border-radius: 14px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .slider-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .slider-top strong {
+        font-size: 14px;
+      }
+
+      .range-input {
+        width: 100%;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+
+      .sim-readout {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 22px;
+        border-radius: 16px;
+        background: var(--sidebar);
+        border: 1px solid var(--line);
+      }
+
+      .readout-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      .metric-box {
+        padding: 14px;
+        border-radius: 12px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+      }
+
+      .metric-label {
+        font-size: 12px;
+        color: var(--text-3);
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .metric-val {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--text);
+      }
+
+      .save-strip {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
+      .save-btns {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .mini-btn {
+        padding: 7px 13px;
+        border-radius: 9px;
+        border: 1px solid var(--line-strong);
+        background: var(--surface-2);
+        color: var(--text);
+        font-family: var(--font);
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition:
+          background-color 150ms var(--ease-out),
+          transform 120ms var(--ease-out);
+      }
+
+      .mini-btn:active {
+        transform: scale(0.96);
+      }
+
+      @media (hover: hover) and (pointer: fine) {
+        .mini-btn:hover {
+          background: var(--surface-3);
+        }
+      }
+
+      .live-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        height: 36px;
+        padding: 0 14px;
+        border-radius: 999px;
+        background: #121317;
+        border: 1px solid rgba(242, 242, 244, 0.16);
+        color: #f2f2f4;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        transition: border-color 220ms var(--ease-out);
+      }
+
+      .live-badge.saved {
+        border-color: rgba(48, 209, 88, 0.7);
+      }
+
+      .live-badge-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: #3ba7ff;
+        transition: background-color 180ms var(--ease-out);
+      }
+
+      .live-badge.saved .live-badge-dot {
+        background: #30d158;
+      }
+
+      /* SECTION 3: INTERACTIVE 5-TRACK AUDIO BOARD */
+      .audio-layout {
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+
+      .audio-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 18px 24px;
+        border-bottom: 1px solid var(--line);
+        background: var(--sidebar);
+      }
+
+      .track-pills-out {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--text-2);
+      }
+
+      .out-pill {
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent-strong);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .out-pill.muted {
+        background: var(--surface-2);
+        color: var(--text-3);
+        text-decoration: line-through;
+      }
+
+      .audio-columns {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 14px;
+        padding: 24px;
+      }
+
+      .audio-card {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 16px;
+        border-radius: 14px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        min-height: 220px;
+        transition:
+          opacity 200ms var(--ease-out),
+          border-color 200ms var(--ease-out);
+      }
+
+      .audio-card.is-muted {
+        opacity: 0.54;
+        border-color: rgba(255, 55, 95, 0.35);
+      }
+
+      .audio-card-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .track-tile {
+        width: 32px;
+        height: 32px;
+        border-radius: 9px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: #ffffff;
+      }
+
+      .switch-btn {
+        position: relative;
+        width: 40px;
+        height: 22px;
+        border-radius: 999px;
+        border: 0;
+        background: var(--accent);
+        cursor: pointer;
+        padding: 2px;
+        transition: background-color 180ms var(--ease-out);
+      }
+
+      .switch-btn[aria-checked="false"] {
+        background: var(--surface-3);
+      }
+
+      .switch-knob {
+        display: block;
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        background: #ffffff;
+        transform: translateX(18px);
+        transition: transform 200ms var(--ease-drawer);
+      }
+
+      .switch-btn[aria-checked="false"] .switch-knob {
+        transform: translateX(0);
+      }
+
+      .audio-card h3 {
+        margin: 10px 0 4px;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      .audio-card p {
+        margin: 0;
+        font-size: 12.5px;
+        line-height: 1.42;
+        color: var(--text-2);
+      }
+
+      .app-chips-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 8px;
+      }
+
+      .app-pill {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 7px 10px;
+        border-radius: 9px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        font-size: 12.5px;
+        font-weight: 600;
+        color: var(--text);
+        cursor: pointer;
+        text-align: left;
+      }
+
+      .app-pill-left {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .app-badge {
+        width: 18px;
+        height: 18px;
+        border-radius: 5px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 11px;
+        font-weight: 800;
+        color: #ffffff;
+        flex-shrink: 0;
+      }
+
+      .audio-screenshot-strip {
+        display: grid;
+        grid-template-columns: 1.15fr 0.85fr;
+        gap: 24px;
+        align-items: center;
+        margin-top: 8px;
+      }
+
+      .shot-frame img {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      /* SECTION 4: ASYMMETRIC ENGINEERING BENTO GRID */
+      .bento-grid {
+        display: grid;
+        grid-template-columns: repeat(12, minmax(0, 1fr));
+        gap: 20px;
+      }
+
+      .span-8 {
+        grid-column: span 8;
+      }
+      .span-7 {
+        grid-column: span 7;
+      }
+      .span-5 {
+        grid-column: span 5;
+      }
+      .span-4 {
+        grid-column: span 4;
+      }
+
+      .bento-pad {
+        padding: 28px;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-start;
+        gap: 18px;
+      }
+
+      .bento-pad h3 {
+        margin: 0 0 8px;
+        font-size: 21px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .bento-pad p {
+        margin: 0;
+        font-size: 14.5px;
+        color: var(--text-2);
+        line-height: 1.55;
+      }
+
+      .pipeline-flow {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 10px;
+        margin-top: 8px;
+      }
+
+      .pipe-step {
+        position: relative;
+        padding: 14px 12px;
+        border-radius: 12px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .pipe-step strong {
+        font-size: 13px;
+        color: var(--text);
+      }
+
+      .pipe-step span {
+        font-size: 12px;
+        color: var(--text-2);
+      }
+
+      .soak-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
+      .soak-stat {
+        padding: 8px 14px;
+        border-radius: 10px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        font-size: 13px;
+      }
+
+      .soak-stat strong {
+        color: var(--accent);
+        margin-right: 6px;
+      }
+
+      .safety-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .safety-list li {
+        display: block;
+        padding: 11px 14px;
+        border-radius: 11px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        font-size: 13.5px;
+        line-height: 1.5;
+        color: var(--text-2);
+      }
+
+      .safety-list strong {
+        color: var(--text);
+      }
+
+      .bento-shot {
+        margin-top: auto;
+        height: 292px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        overflow: hidden;
+        background: #0e0f12;
+      }
+
+      .bento-shot img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+      }
+
+      .bento-shot-settings img {
+        object-position: center center;
+      }
+
+      .source-demo {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px 16px;
+        padding: 14px 16px;
+        border-radius: 12px;
+        background: var(--sidebar);
+        border: 1px solid var(--line);
+      }
+
+      .source-buttons {
+        display: inline-flex;
+        padding: 3px;
+        border-radius: 10px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        gap: 4px;
+      }
+
+      .source-btn {
+        padding: 6px 11px;
+        border-radius: 7px;
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--text-2);
+        font-family: var(--font);
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        cursor: pointer;
+        transition:
+          background-color 160ms var(--ease-out),
+          border-color 160ms var(--ease-out),
+          color 160ms var(--ease-out);
+      }
+
+      .source-btn[aria-pressed="true"] {
+        background: var(--accent-soft);
+        border-color: var(--accent);
+        color: var(--text);
+      }
+
+      .corner-demo {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 18px;
+        padding: 16px 18px;
+        border-radius: 12px;
+        background: var(--sidebar);
+        border: 1px solid var(--line);
+      }
+
+      .corner-meta-col {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-width: 0;
+      }
+
+      .corner-buttons {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(112px, 1fr));
+        gap: 8px;
+        max-width: 268px;
+      }
+
+      .corner-btn {
+        padding: 7px 14px;
+        border-radius: 8px;
+        border: 1px solid var(--line-strong);
+        background: var(--surface-2);
+        color: var(--text-2);
+        font-family: var(--font);
+        font-size: 12.5px;
+        font-weight: 600;
+        text-align: center;
+        white-space: nowrap;
+        cursor: pointer;
+        transition:
+          background-color 160ms var(--ease-out),
+          border-color 160ms var(--ease-out),
+          color 160ms var(--ease-out);
+      }
+
+      .corner-btn[aria-pressed="true"] {
+        background: var(--accent-soft);
+        border-color: var(--accent);
+        color: var(--text);
+      }
+
+      .corner-stage {
+        position: relative;
+        width: 248px;
+        height: 132px;
+        border-radius: 10px;
+        background:
+          radial-gradient(circle at 50% 42%, rgba(59, 167, 255, 0.08), transparent 68%),
+          #0e0f12;
+        border: 1.5px solid var(--line-strong);
+        box-shadow: inset 0 0 24px rgba(0, 0, 0, 0.65);
+        flex-shrink: 0;
+      }
+
+      .corner-stage::after {
+        content: "";
+        position: absolute;
+        inset: 22px;
+        border-radius: 6px;
+        border: 1px dashed rgba(255, 255, 255, 0.08);
+        pointer-events: none;
+      }
+
+      .corner-slot {
+        position: absolute;
+        width: 34px;
+        height: 12px;
+        padding: 0;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        cursor: pointer;
+        z-index: 1;
+        transition:
+          background-color 160ms var(--ease-out),
+          border-color 160ms var(--ease-out);
+      }
+
+      .corner-slot[data-pos="top-left"] {
+        top: 10px;
+        left: 10px;
+      }
+      .corner-slot[data-pos="top-right"] {
+        top: 10px;
+        right: 10px;
+      }
+      .corner-slot[data-pos="bottom-left"] {
+        bottom: 10px;
+        left: 10px;
+      }
+      .corner-slot[data-pos="bottom-right"] {
+        bottom: 10px;
+        right: 10px;
+      }
+
+      .corner-slot[aria-pressed="true"] {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .corner-live-badge {
+        position: absolute;
+        z-index: 2;
+        height: 28px;
+        padding: 0 11px;
+        gap: 7px;
+        font-size: 11px;
+        pointer-events: none;
+        transition:
+          top 220ms var(--ease-out),
+          right 220ms var(--ease-out),
+          bottom 220ms var(--ease-out),
+          left 220ms var(--ease-out);
+      }
+
+      .corner-live-badge[data-pos="top-left"] {
+        top: 10px;
+        left: 10px;
+      }
+      .corner-live-badge[data-pos="top-right"] {
+        top: 10px;
+        right: 10px;
+      }
+      .corner-live-badge[data-pos="bottom-left"] {
+        bottom: 10px;
+        left: 10px;
+      }
+      .corner-live-badge[data-pos="bottom-right"] {
+        bottom: 10px;
+        right: 10px;
+      }
+
+      /* SECTION 5: SHORTCUTS, QUICK START & CLI */
+      .ops-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 24px;
+        align-items: start;
+      }
+
+      .hk-table {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .hk-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 14px 18px;
+        border-radius: 13px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        cursor: pointer;
+        width: 100%;
+        text-align: left;
+        color: var(--text);
+        font-family: var(--font);
+        transition:
+          border-color 160ms var(--ease-out),
+          background-color 160ms var(--ease-out);
+      }
+
+      .hk-item[aria-selected="true"] {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+      }
+
+      .hk-item span:first-child {
+        font-size: 14.5px;
+        font-weight: 600;
+      }
+
+      .hk-kbd {
+        padding: 5px 10px;
+        border-radius: 8px;
+        background: var(--surface-elevated);
+        border: 1px solid var(--line-strong);
+        font-size: 12.5px;
+        font-weight: 600;
+        color: var(--accent-strong);
+        white-space: nowrap;
+      }
+
+      .steps-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .steps-list li {
+        display: flex;
+        gap: 12px;
+        align-items: flex-start;
+        font-size: 14.5px;
+        color: var(--text-2);
+      }
+
+      .step-num {
+        width: 24px;
+        height: 24px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        border: 1px solid var(--accent);
+        color: var(--accent-strong);
+        font-size: 12px;
+        font-weight: 700;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        margin-top: 1px;
+      }
+
+      .cli-box {
+        margin-top: 18px;
+        border-radius: 14px;
+        background: #0d0e11;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        overflow: hidden;
+      }
+
+      .cli-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 14px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        color: #9aa4b8;
+        font-size: 12px;
+      }
+
+      .copy-btn {
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        background: rgba(255, 255, 255, 0.07);
+        color: #f2f2f4;
+        font-family: var(--font);
+        font-size: 12px;
+        font-weight: 600;
+        padding: 4px 10px;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+
+      .cli-pre {
+        margin: 0;
+        padding: 16px;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+        color: #d6deec;
+        overflow-x: auto;
+      }
+
+      /* FOOTER */
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 44px 0 56px;
+      }
+
+      .footer-inner {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      .footer-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 14px;
+        color: var(--text-2);
+      }
+
+      .footer-brand img {
+        width: 28px;
+        height: 28px;
+      }
+
+      .footer-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 18px;
+      }
+
+      .footer-links a {
+        color: var(--text-2);
+        text-decoration: none;
+        font-size: 14px;
+        font-weight: 500;
+      }
+
+      .footer-links a:hover {
+        color: var(--text);
+      }
+
+      /* Scroll Reveal */
+      [data-reveal] {
+        opacity: 1;
+        transform: translateY(0);
+        transition:
+          opacity 520ms var(--ease-out),
+          transform 520ms var(--ease-out);
+      }
+
+      [data-reveal="pending"] {
+        opacity: 0;
+        transform: translateY(18px);
+      }
+
+      /* RESPONSIVE COLLAPSE */
+      .sim-grid > *,
+      .ops-grid > *,
+      .bento-grid > *,
+      .hero-grid > *,
+      .audio-columns > * {
+        min-width: 0;
+      }
+
+      @media (max-width: 1080px) {
+        .hero-grid,
+        .sim-grid,
+        .audio-screenshot-strip,
+        .ops-grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .audio-columns {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+        .span-8,
+        .span-7,
+        .span-5,
+        .span-4 {
+          grid-column: span 12;
+        }
+        .pipeline-flow {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .bento-shot {
+          height: auto;
+          aspect-ratio: 16 / 10;
+        }
+      }
+
+      @media (max-width: 768px) {
+        .container {
+          padding: 0 16px;
+        }
+        .nav-links {
+          display: none;
+        }
+        .nav-pill {
+          width: auto;
+          max-width: 100%;
+          gap: 12px;
+        }
+        .hero {
+          padding: 96px 0 40px;
+        }
+        .section {
+          padding: 64px 0;
+        }
+        .sim-grid,
+        .audio-columns,
+        .bento-pad {
+          padding: 18px;
+        }
+        .seg-tabs {
+          max-width: 100%;
+          flex-wrap: wrap;
+        }
+        .seg-btn {
+          padding: 5px 10px;
+          font-size: 12px;
+        }
+        .hk-item {
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+        .preset-row,
+        .custom-controls,
+        .readout-metrics,
+        .audio-columns,
+        .pipeline-flow {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .stage-header {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+        .corner-demo {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .corner-buttons {
+          max-width: 100%;
+        }
+        .corner-stage {
+          width: 100%;
+          max-width: 280px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          scroll-behavior: auto !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="ambient-field" aria-hidden="true"></div>
+
+    <!-- Floating Glass Navigation -->
+    <header class="nav-wrap">
+      <nav class="nav-pill" aria-label="Primary navigation">
+        <a class="brand-link" href="#top" aria-label="SuiCap Home">
+          <img class="logo-dark" src="media/suicap-lockup-dark.svg" alt="SuiCap" />
+          <img class="logo-light" src="media/suicap-lockup-light.svg" alt="SuiCap" />
+        </a>
+
+        <div class="nav-links">
+          <a href="#top">Showcase</a>
+          <a href="#replay">Replay</a>
+          <a href="#audio">Audio Routing</a>
+          <a href="#architecture">Pipeline</a>
+          <a href="#shortcuts">Quick Start</a>
+        </div>
+
+        <div class="nav-actions">
+          <button
+            id="theme-toggle"
+            class="theme-btn"
+            type="button"
+            aria-label="Toggle light or dark theme"
+            title="Switch Light / Dark theme"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+            </svg>
+          </button>
+
+          <a
+            class="btn-pill btn-pill-sm"
+            data-download-exe
+            href="https://github.com/giran03/SuiCap/releases/latest/download/SuiCap_0.1.0_x64-setup.exe"
+            download="SuiCap-setup.exe"
+            title="Download latest SuiCap Windows installer (.exe)"
+          >
+            <span>Download</span>
+            <span class="btn-pill-icon" aria-hidden="true">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+                <path d="M12 4v11M7 11l5 5 5-5M5 20h14" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </span>
+          </a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="top">
+      <!-- HERO SECTION -->
+      <section class="hero">
+        <div class="container">
+          <div class="hero-grid">
+            <div class="hero-copy">
+              <h1 class="hero-title">
+                Never miss the moment. <span class="accent">Save it after it happens.</span>
+              </h1>
+              <p class="hero-sub">
+                Always-on GPU replay-buffer recorder for Windows with zero-copy D3D11 encoding, five isolated audio
+                tracks, and zero game injection.
+              </p>
+
+              <div class="hero-ctas">
+                <a
+                  id="hero-download-btn"
+                  class="btn-pill"
+                  data-download-exe
+                  href="https://github.com/giran03/SuiCap/releases/latest/download/SuiCap_0.1.0_x64-setup.exe"
+                  download="SuiCap-setup.exe"
+                  title="Download latest SuiCap Windows installer (.exe)"
+                >
+                  <span>Download for Windows</span>
+                  <span class="btn-pill-icon" aria-hidden="true">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+                      <path d="M12 4v11M7 11l5 5 5-5M5 20h14" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </span>
+                </a>
+
+                <a
+                  class="btn-ghost"
+                  href="https://github.com/giran03/SuiCap"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <span>GitHub Repository</span>
+                </a>
+              </div>
+
+              <div class="hero-facts">
+                <span class="fact-chip"><span class="fact-dot"></span>Windows 10 2004+ &amp; 11</span>
+                <span class="fact-chip"><span class="fact-dot"></span>AV1 · HEVC · H.264</span>
+                <span class="fact-chip"><span class="fact-dot"></span>&lt; 1% CPU · Anti-Cheat Safe</span>
+              </div>
+            </div>
+
+            <div class="bezel-outer">
+              <div class="bezel-inner">
+                <div class="stage-header">
+                  <div class="seg-tabs" role="tablist" aria-label="Product showcase views">
+                    <button
+                      class="seg-btn"
+                      type="button"
+                      role="tab"
+                      aria-selected="true"
+                      data-src="media/suicap-showcase.gif"
+                      data-meta="16:9 Silent Motion Showcase · .gif"
+                      data-alt="SuiCap 16:9 motion showcase demonstrating hotkey replay save, zero-copy dashboard metrics, and 5-track audio mute"
+                    >
+                      Motion Showcase
+                    </button>
+                    <button
+                      class="seg-btn"
+                      type="button"
+                      role="tab"
+                      aria-selected="false"
+                      data-src="media/suicap-tour.gif"
+                      data-meta="Recorded App Tour · Mock Session"
+                      data-alt="SuiCap UI walkthrough showing dashboard, audio routing board, and settings window"
+                    >
+                      UI Tour
+                    </button>
+                    <button
+                      class="seg-btn"
+                      type="button"
+                      role="tab"
+                      aria-selected="false"
+                      data-src="media/overview.webp"
+                      data-meta="Full Dashboard · 1280px"
+                      data-alt="Complete SuiCap dashboard with replay status, buffer controls, shortcuts, video picker, and audio board"
+                    >
+                      Overview
+                    </button>
+                  </div>
+                  <span id="stage-meta" class="stage-meta mono">16:9 Silent Motion Showcase · .gif</span>
+                </div>
+
+                <div class="stage-media">
+                  <img
+                    id="stage-img"
+                    src="media/suicap-showcase.gif"
+                    alt="SuiCap 16:9 motion showcase demonstrating hotkey replay save, zero-copy dashboard metrics, and 5-track audio mute"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 2: INTERACTIVE REPLAY BUFFER & RAM CALCULATOR -->
+      <section id="replay" class="section" data-reveal>
+        <div class="container">
+          <div class="section-head">
+            <h2>Compressed packets in RAM, ready on one hotkey</h2>
+            <p>
+              Keep 10 seconds to 10 minutes buffered in memory without touching disk until you press save. Presets pick
+              the cleanest encoder path for your GPU, or switch to Custom for resolution, frame rate, codec, and quality.
+            </p>
+          </div>
+
+          <div class="bezel-outer">
+            <div class="bezel-inner">
+              <div class="sim-grid">
+                <div class="sim-col">
+                  <div class="preset-row" role="group" aria-label="Video presets">
+                    <button class="preset-card" type="button" data-preset="compat" aria-pressed="false">
+                      <span class="preset-name">Compatible</span>
+                      <span class="preset-desc">H.264 1080p60. Plays on any device and site.</span>
+                    </button>
+                    <button class="preset-card" type="button" data-preset="balanced" aria-pressed="false">
+                      <span class="preset-name">Balanced</span>
+                      <span class="preset-desc">Best codec your GPU has, 1080p60.</span>
+                    </button>
+                    <button class="preset-card" type="button" data-preset="high" aria-pressed="true">
+                      <span class="preset-name">High</span>
+                      <span class="preset-desc">Your monitor's own resolution, 60 fps.</span>
+                    </button>
+                    <button class="preset-card" type="button" data-preset="custom" aria-pressed="false">
+                      <span class="preset-name">Custom</span>
+                      <span class="preset-desc">Pick resolution, frame rate, and codec.</span>
+                    </button>
+                  </div>
+
+                  <div id="custom-panel" class="custom-controls" hidden>
+                    <div class="field-group">
+                      <label for="sim-res">Resolution</label>
+                      <select id="sim-res" class="field-select">
+                        <option value="1280x720">1280 × 720</option>
+                        <option value="1920x1080">1920 × 1080</option>
+                        <option value="2560x1440" selected>2560 × 1440</option>
+                        <option value="3840x2160">3840 × 2160 (4K)</option>
+                      </select>
+                    </div>
+                    <div class="field-group">
+                      <label for="sim-fps">Frame rate</label>
+                      <select id="sim-fps" class="field-select">
+                        <option value="60" selected>60 fps</option>
+                        <option value="120">120 fps</option>
+                        <option value="240">240 fps</option>
+                      </select>
+                    </div>
+                    <div class="field-group">
+                      <label for="sim-codec">Codec</label>
+                      <select id="sim-codec" class="field-select">
+                        <option value="av1" selected>AV1 (0.8×)</option>
+                        <option value="hevc">HEVC (1.0×)</option>
+                        <option value="h264">H.264 (1.5×)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div class="slider-panel">
+                    <div class="slider-top">
+                      <strong>Buffer length</strong>
+                      <span id="buf-label" class="mono">2 min (120 s)</span>
+                    </div>
+                    <input
+                      id="buf-slider"
+                      class="range-input"
+                      type="range"
+                      min="15"
+                      max="600"
+                      step="15"
+                      value="120"
+                      aria-label="Buffer length in seconds"
+                    />
+                    <div class="slider-top">
+                      <span id="ram-caption" style="font-size: 13px; color: var(--text-2)">
+                        Up to 360 MB of memory at the maximum bitrate (24 Mbps AV1).
+                      </span>
+                      <div class="seg-tabs" role="group" aria-label="Output container format">
+                        <button class="seg-btn fmt-btn" type="button" data-fmt="MP4" aria-selected="false">MP4</button>
+                        <button class="seg-btn fmt-btn" type="button" data-fmt="MKV" aria-selected="true">MKV</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="sim-readout">
+                  <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px">
+                      <strong style="font-size: 16px">Replay Engine Preview</strong>
+                      <span id="sim-spec-tag" class="mono" style="font-size: 12.5px; color: var(--accent)">
+                        av1_nvenc · 2560×1440 @ 60 fps
+                      </span>
+                    </div>
+                    <div class="readout-metrics">
+                      <div class="metric-box">
+                        <span class="metric-label">Max buffer RAM</span>
+                        <span id="sim-ram" class="metric-val mono">360 MB</span>
+                      </div>
+                      <div class="metric-box">
+                        <span class="metric-label">Working set</span>
+                        <span class="metric-val mono">63–65 MB</span>
+                      </div>
+                      <div class="metric-box">
+                        <span class="metric-label">Dropped</span>
+                        <span class="metric-val mono">0 frames</span>
+                      </div>
+                    </div>
+                    <p id="fmt-note" style="margin: 14px 0 0; font-size: 13px; color: var(--text-2)">
+                      MKV preserves named audio tracks (Mix, Mic, Game, Voice, Media) in mpv and VLC using Opus audio.
+                    </p>
+                  </div>
+
+                  <div class="save-strip">
+                    <div class="save-btns">
+                      <button class="mini-btn save-trigger" type="button" data-save="15">Save 15 s</button>
+                      <button class="mini-btn save-trigger" type="button" data-save="30">Save 30 s</button>
+                      <button class="mini-btn save-trigger" type="button" data-save="60">Save 60 s</button>
+                      <button class="mini-btn save-trigger" type="button" data-save="full">Whole buffer</button>
+                    </div>
+                    <div id="sim-badge" class="live-badge" role="status">
+                      <span class="live-badge-dot"></span>
+                      <span id="sim-badge-text" class="mono">REPLAY · 120 s</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 3: 5-TRACK PER-APP AUDIO ROUTING -->
+      <section id="audio" class="section" data-reveal>
+        <div class="container audio-layout">
+          <div class="section-head" style="margin-bottom: 12px">
+            <h2>Five isolated audio tracks, routed per application</h2>
+            <p>
+              WASAPI process loopback splits your game, voice chat, music players, and microphone onto separate tracks.
+              Toggle any track below to test strict live mute — silenced tracks disappear from the Mix too.
+            </p>
+          </div>
+
+          <div class="bezel-outer">
+            <div class="bezel-inner">
+              <div class="audio-bar">
+                <div class="track-pills-out">
+                  <strong style="color: var(--text); margin-right: 4px">Tracks saved to clip:</strong>
+                  <span class="out-pill" data-pill="mix">Mix</span>
+                  <span class="out-pill" data-pill="mic">Mic</span>
+                  <span class="out-pill" data-pill="game">Game</span>
+                  <span class="out-pill" data-pill="voice">Voice</span>
+                  <span class="out-pill" data-pill="media">Media</span>
+                </div>
+                <span id="audio-status-note" class="mono" style="font-size: 12.5px; color: var(--text-2)">
+                  All 5 tracks live · Click any app chip to reassign track
+                </span>
+              </div>
+
+              <div class="audio-columns">
+                <!-- Mix -->
+                <div class="audio-card" data-track="mix">
+                  <div>
+                    <div class="audio-card-top">
+                      <span class="track-tile" style="background: var(--accent)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                          <path d="M4 12h2M9 7v10M14 4v16M19 9v6" stroke-linecap="round" />
+                        </svg>
+                      </span>
+                      <button class="switch-btn track-switch" type="button" role="switch" aria-checked="true" aria-label="Toggle Mix track" data-track="mix">
+                        <span class="switch-knob"></span>
+                      </button>
+                    </div>
+                    <h3>Mix</h3>
+                    <p>Combined and level-limited. Plays by default in media players.</p>
+                  </div>
+                  <div class="mono" style="font-size: 12px; color: var(--text-3)">Track 1 · Always active sources</div>
+                </div>
+
+                <!-- Microphone -->
+                <div class="audio-card" data-track="mic">
+                  <div>
+                    <div class="audio-card-top">
+                      <span class="track-tile" style="background: #30d158">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                          <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3" stroke-linecap="round" />
+                        </svg>
+                      </span>
+                      <button class="switch-btn track-switch" type="button" role="switch" aria-checked="true" aria-label="Toggle Microphone track" data-track="mic">
+                        <span class="switch-knob"></span>
+                      </button>
+                    </div>
+                    <h3>Microphone</h3>
+                    <p>Follows your input automatically if unplugged and replugged.</p>
+                  </div>
+                  <div class="mono" style="font-size: 12px; color: var(--text-3)">System default mic</div>
+                </div>
+
+                <!-- Game -->
+                <div class="audio-card" data-track="game">
+                  <div>
+                    <div class="audio-card-top">
+                      <span class="track-tile" style="background: var(--track-game)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                          <path d="M6 11h4M8 9v4M17.3 5H6.7a4 4 0 0 0-3.9 3.1l-1.2 5.4A3 3 0 0 0 4.5 17a3 3 0 0 0 2.4-1.2L8 14h8l1.1 1.8A3 3 0 0 0 19.5 17a3 3 0 0 0 2.9-3.5l-1.2-5.4A4 4 0 0 0 17.3 5z" stroke-linecap="round" />
+                        </svg>
+                      </span>
+                      <button class="switch-btn track-switch" type="button" role="switch" aria-checked="true" aria-label="Toggle Game track" data-track="game">
+                        <span class="switch-knob"></span>
+                      </button>
+                    </div>
+                    <h3>Game</h3>
+                    <p>Or follows the full-screen app in front when left empty.</p>
+                  </div>
+                  <div id="slot-game" class="app-chips-list"></div>
+                </div>
+
+                <!-- Voice chat -->
+                <div class="audio-card" data-track="voice">
+                  <div>
+                    <div class="audio-card-top">
+                      <span class="track-tile" style="background: var(--track-voice)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                          <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5 11a7 7 0 0 0 14 0M12 18v3" stroke-linecap="round" />
+                        </svg>
+                      </span>
+                      <button class="switch-btn track-switch" type="button" role="switch" aria-checked="true" aria-label="Toggle Voice chat track" data-track="voice">
+                        <span class="switch-knob"></span>
+                      </button>
+                    </div>
+                    <h3>Voice chat</h3>
+                    <p>Keep Discord or TeamSpeak separate so you can turn friends down later.</p>
+                  </div>
+                  <div id="slot-voice" class="app-chips-list"></div>
+                </div>
+
+                <!-- Music and media -->
+                <div class="audio-card" data-track="media">
+                  <div>
+                    <div class="audio-card-top">
+                      <span class="track-tile" style="background: var(--track-media)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                          <path d="M9 18V6l11-2v12M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zM20 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z" stroke-linecap="round" />
+                        </svg>
+                      </span>
+                      <button class="switch-btn track-switch" type="button" role="switch" aria-checked="true" aria-label="Toggle Music and media track" data-track="media">
+                        <span class="switch-knob"></span>
+                      </button>
+                    </div>
+                    <h3>Music and media</h3>
+                    <p>Mute copyrighted playlists mid-session or before uploading.</p>
+                  </div>
+                  <div id="slot-media" class="app-chips-list"></div>
+                </div>
+
+                <!-- Not recorded -->
+                <div class="audio-card" data-track="ignored">
+                  <div>
+                    <div class="audio-card-top">
+                      <span class="track-tile" style="background: var(--track-muted)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                          <circle cx="12" cy="12" r="9" />
+                          <path d="M5.7 5.7l12.6 12.6" stroke-linecap="round" />
+                        </svg>
+                      </span>
+                      <span class="mono" style="font-size: 11px; color: var(--text-3)">PARKED</span>
+                    </div>
+                    <h3>Not recorded</h3>
+                    <p>Apps parked here never enter any track or the Mix.</p>
+                  </div>
+                  <div id="slot-ignored" class="app-chips-list"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="audio-screenshot-strip">
+            <div class="bezel-outer">
+              <div class="bezel-inner shot-frame">
+                <img src="media/audio.webp" alt="SuiCap audio routing board inside the app" loading="lazy" />
+              </div>
+            </div>
+            <div style="padding: 8px 4px">
+              <h3 style="margin: 0 0 10px; font-size: 22px; font-weight: 700">Live OS detection, zero noise</h3>
+              <p style="margin: 0 0 14px; color: var(--text-2); font-size: 15px">
+                Running apps surface automatically in the tray as Windows reports audio sessions. Drag an app card onto
+                any track, drop an <code class="mono">.exe</code> from Explorer, or park apps in Not recorded so
+                notifications and background streams stay out of every clip.
+              </p>
+              <p style="margin: 0; color: var(--text-2); font-size: 15px">
+                Switching a track off mutes its applications everywhere immediately — both on its isolated track and in the
+                combined Mix.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 4: ENGINEERING BENTO GRID -->
+      <section id="architecture" class="section" data-reveal>
+        <div class="container">
+          <div class="section-head">
+            <h2>Engineered for under 1% CPU and zero frame drops</h2>
+            <p>
+              Video frames stay in GPU memory from display capture to hardware encoder, avoiding CPU copies, driver locks,
+              and game hooks.
+            </p>
+          </div>
+
+          <div class="bento-grid">
+            <!-- Cell 1: Zero-Copy Pipeline -->
+            <div class="bezel-outer span-8">
+              <div class="bezel-inner bento-pad">
+                <div>
+                  <h3>Zero-copy D3D11 hardware pipeline</h3>
+                  <p>
+                    Captured frames move directly on the GPU through <code class="mono">VideoProcessorBlt</code> into
+                    FFmpeg D3D11 hardware surfaces, encode via NVENC, AMF, or Quick Sync, and live in a bounded GOP ring
+                    buffer until snapshot export.
+                  </p>
+                </div>
+
+                <div class="pipeline-flow" aria-label="Zero-copy GPU pipeline stages">
+                  <div class="pipe-step">
+                    <strong>1. WGC / DDA</strong>
+                    <span>OS frame capture</span>
+                  </div>
+                  <div class="pipe-step">
+                    <strong>2. D3D11 Blt</strong>
+                    <span>NV12 / P010 scale</span>
+                  </div>
+                  <div class="pipe-step">
+                    <strong>3. GPU Encode</strong>
+                    <span>AV1 · HEVC · H.264</span>
+                  </div>
+                  <div class="pipe-step">
+                    <strong>4. RAM Ring</strong>
+                    <span>GOP packet buffer</span>
+                  </div>
+                  <div class="pipe-step">
+                    <strong>5. Snapshot Mux</strong>
+                    <span>MP4 / MKV export</span>
+                  </div>
+                </div>
+
+                <div class="soak-row mono">
+                  <span class="soak-stat"><strong>0 / 108,000</strong>dropped frames (30-min soak)</span>
+                  <span class="soak-stat"><strong>63–65 MB</strong>steady private working set</span>
+                  <span class="soak-stat"><strong>±20 ms</strong>A/V QPC sync bound</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Cell 2: Anti-Cheat Safety -->
+            <div class="bezel-outer span-4">
+              <div class="bezel-inner bento-pad">
+                <div>
+                  <h3>Anti-cheat safe by design</h3>
+                  <p style="margin-top: 6px">
+                    No hooks inside your game process — just standard Windows capture and hotkey APIs.
+                  </p>
+                </div>
+                <ul class="safety-list">
+                  <li>
+                    <strong>Zero DLL injection:</strong> uses Windows Graphics Capture and Desktop Duplication only.
+                  </li>
+                  <li>
+                    <strong>Zero keyboard hooks:</strong> global shortcuts bind via <code class="mono">RegisterHotKey</code>.
+                  </li>
+                  <li>
+                    <strong>Self-recovering:</strong> rebuilds automatically if a display, window, or driver resets.
+                  </li>
+                </ul>
+              </div>
+            </div>
+
+            <!-- Cell 3: Smart Source Capture -->
+            <div class="bezel-outer span-5">
+              <div class="bezel-inner bento-pad">
+                <div>
+                  <h3>Capture a display, window, or full-screen game</h3>
+                  <p>
+                    Switch between <strong>Display</strong>, <strong>Application</strong> (with exact window title
+                    matching and display fallback), or <strong>Auto</strong> full-screen tracking with
+                    <code class="mono">Ctrl+Alt+F7</code>.
+                  </p>
+                </div>
+
+                <div class="source-demo">
+                  <div>
+                    <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px">Capture Source Mode</div>
+                    <div id="source-readout" class="mono" style="font-size: 12px; color: var(--text-2)">
+                      Horizon.exe · Exact match · Ctrl+Alt+F7
+                    </div>
+                  </div>
+                  <div class="source-buttons" role="group" aria-label="Capture source mode preview">
+                    <button
+                      class="source-btn"
+                      type="button"
+                      data-mode="Display"
+                      data-detail="Main monitor (2560×1440) · Desktop capture"
+                      aria-pressed="false"
+                    >
+                      Display
+                    </button>
+                    <button
+                      class="source-btn"
+                      type="button"
+                      data-mode="Application"
+                      data-detail="Horizon.exe · Exact match · Ctrl+Alt+F7"
+                      aria-pressed="true"
+                    >
+                      Application
+                    </button>
+                    <button
+                      class="source-btn"
+                      type="button"
+                      data-mode="Auto"
+                      data-detail="Follows full-screen games automatically"
+                      aria-pressed="false"
+                    >
+                      Auto
+                    </button>
+                  </div>
+                </div>
+
+                <div class="bento-shot">
+                  <img src="media/dashboard.webp" alt="SuiCap replay status and video source picker" loading="lazy" />
+                </div>
+              </div>
+            </div>
+
+            <!-- Cell 4: Stealth Badge, Lossless Trim & Updates -->
+            <div class="bezel-outer span-7">
+              <div class="bezel-inner bento-pad">
+                <div>
+                  <h3>Stealth recording badge, lossless trim &amp; checksum updates</h3>
+                  <p>
+                    A click-through corner pill shows buffer status while staying excluded from clips and screenshots.
+                    The built-in Clips library trims highlights losslessly into a new copy while keeping the original
+                    intact, and self-updates verify every installer against its release checksum.
+                  </p>
+                </div>
+
+                <div class="corner-demo">
+                  <div class="corner-meta-col">
+                    <div>
+                      <div style="font-size: 13px; font-weight: 700; margin-bottom: 4px">Interactive Badge Corner</div>
+                      <div id="corner-readout" class="mono" style="font-size: 12px; color: var(--text-2)">
+                        Bottom right · Hidden from capture
+                      </div>
+                    </div>
+
+                    <div class="corner-buttons" role="group" aria-label="Badge corner preview">
+                      <button class="corner-btn" type="button" data-corner="Top left" data-pos="top-left" aria-pressed="false">Top left</button>
+                      <button class="corner-btn" type="button" data-corner="Top right" data-pos="top-right" aria-pressed="false">Top right</button>
+                      <button class="corner-btn" type="button" data-corner="Bottom left" data-pos="bottom-left" aria-pressed="false">Bottom left</button>
+                      <button class="corner-btn" type="button" data-corner="Bottom right" data-pos="bottom-right" aria-pressed="true">Bottom right</button>
+                    </div>
+                  </div>
+
+                  <div class="corner-stage" aria-label="Monitor corner preview stage">
+                    <button class="corner-slot" type="button" data-corner="Top left" data-pos="top-left" aria-label="Place badge Top left" aria-pressed="false"></button>
+                    <button class="corner-slot" type="button" data-corner="Top right" data-pos="top-right" aria-label="Place badge Top right" aria-pressed="false"></button>
+                    <button class="corner-slot" type="button" data-corner="Bottom left" data-pos="bottom-left" aria-label="Place badge Bottom left" aria-pressed="false"></button>
+                    <button class="corner-slot" type="button" data-corner="Bottom right" data-pos="bottom-right" aria-label="Place badge Bottom right" aria-pressed="true"></button>
+                    <div id="corner-badge-pill" class="live-badge corner-live-badge" data-pos="bottom-right">
+                      <span class="live-badge-dot"></span>
+                      <span class="mono">REPLAY · 104 s</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="bento-shot bento-shot-settings">
+                  <img src="media/settings.webp" alt="SuiCap Settings window showing General feedback and recording badge controls" loading="lazy" />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 5: SHORTCUTS, QUICK START & CLI -->
+      <section id="shortcuts" class="section" data-reveal>
+        <div class="container">
+          <div class="section-head">
+            <h2>Default shortcuts &amp; quick start</h2>
+            <p>
+              Every hotkey works inside full-screen games and can be rebound, cleared, or reset. Prefer automation or
+              headless soaks? <code class="mono">suicap-cli</code> shares the exact same Rust core.
+            </p>
+          </div>
+
+          <div class="ops-grid">
+            <div class="bezel-outer">
+              <div class="bezel-inner" style="padding: 24px">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px">
+                  <strong style="font-size: 17px">Global Hotkeys</strong>
+                  <span id="hk-active-note" class="mono" style="font-size: 12px; color: var(--accent)">
+                    Click any row to inspect
+                  </span>
+                </div>
+
+                <div class="hk-table" role="listbox" aria-label="Default keyboard shortcuts">
+                  <button class="hk-item" type="button" role="option" aria-selected="false" data-detail="Saves the trailing 15 seconds into a folder named after the active game.">
+                    <span>Save last 15 seconds</span>
+                    <span class="hk-kbd mono">Ctrl+Alt+F9</span>
+                  </button>
+                  <button class="hk-item" type="button" role="option" aria-selected="true" data-detail="Default highlight capture: saves the last 30 seconds and flashes CLIP SAVED.">
+                    <span>Save last 30 seconds</span>
+                    <span class="hk-kbd mono">Ctrl+Alt+F10</span>
+                  </button>
+                  <button class="hk-item" type="button" role="option" aria-selected="false" data-detail="Saves a full minute from the compressed RAM ring buffer.">
+                    <span>Save last 60 seconds</span>
+                    <span class="hk-kbd mono">Ctrl+Alt+F11</span>
+                  </button>
+                  <button class="hk-item" type="button" role="option" aria-selected="false" data-detail="Exports up to your full configured buffer length (10 s to 10 min).">
+                    <span>Save whole buffer</span>
+                    <span class="hk-kbd mono">Ctrl+Alt+F12</span>
+                  </button>
+                  <button class="hk-item" type="button" role="option" aria-selected="false" data-detail="Captures a PNG screenshot directly alongside your saved clips.">
+                    <span>Take a screenshot</span>
+                    <span class="hk-kbd mono">Ctrl+Alt+F8</span>
+                  </button>
+                  <button class="hk-item" type="button" role="option" aria-selected="false" data-detail="Toggles capture source between the foreground app window and the full display.">
+                    <span>Record app in front / display</span>
+                    <span class="hk-kbd mono">Ctrl+Alt+F7</span>
+                  </button>
+                </div>
+
+                <p id="hk-detail" style="margin: 14px 0 0; font-size: 13.5px; color: var(--text-2)">
+                  Default highlight capture: saves the last 30 seconds and flashes CLIP SAVED.
+                </p>
+              </div>
+            </div>
+
+            <div class="bezel-outer">
+              <div class="bezel-inner" style="padding: 24px">
+                <strong style="display: block; font-size: 17px; margin-bottom: 14px">Up and running in five steps</strong>
+                <ol class="steps-list">
+                  <li><span class="step-num">1</span><span>Install from GitHub Releases and launch SuiCap from the Windows tray.</span></li>
+                  <li><span class="step-num">2</span><span>Press <strong>Turn on</strong> to arm the zero-copy GPU replay buffer.</span></li>
+                  <li><span class="step-num">3</span><span>Choose <strong>Display</strong>, pick an <strong>Application</strong>, or leave on <strong>Auto</strong>.</span></li>
+                  <li><span class="step-num">4</span><span>Drag Discord onto <strong>Voice chat</strong> and music apps onto <strong>Music and media</strong>.</span></li>
+                  <li><span class="step-num">5</span><span>Press <code class="mono">Ctrl+Alt+F10</code> after a play and trim clips directly on the Clips page.</span></li>
+                </ol>
+
+                <div class="cli-box">
+                  <div class="cli-head">
+                    <span class="mono">suicap-cli &amp; build from source</span>
+                    <button id="copy-cli" class="copy-btn" type="button">Copy commands</button>
+                  </div>
+                  <pre id="cli-code" class="cli-pre">bun install
+.scripts/"SuiCap Fetch FFmpeg.bat"
+bun run tauri dev
+suicap-cli replay --buffer 120 --display 1</pre>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container footer-inner">
+        <div class="footer-brand">
+          <img class="logo-dark" src="media/suicap-mark.svg" alt="" />
+          <img class="logo-light" src="media/suicap-mark-light.svg" alt="" />
+          <span><strong>SuiCap</strong> · Designed and built by <strong>CafeTako Team</strong></span>
+        </div>
+
+        <div class="footer-links">
+          <a
+            data-download-exe
+            href="https://github.com/giran03/SuiCap/releases/latest/download/SuiCap_0.1.0_x64-setup.exe"
+            download="SuiCap-setup.exe"
+            title="Download latest SuiCap Windows installer (.exe)"
+          >
+            Download
+          </a>
+          <a href="https://github.com/giran03/SuiCap" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="https://github.com/giran03/SuiCap/blob/master/CHANGELOG.md" target="_blank" rel="noreferrer">Changelog</a>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      (function () {
+        // 1. Theme Switcher (persisted in session, defaults to dark)
+        const themeBtn = document.getElementById("theme-toggle");
+        themeBtn.addEventListener("click", () => {
+          const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+          document.documentElement.setAttribute("data-theme", next);
+        });
+
+        // 2. Hero Stage Switcher
+        const stageImg = document.getElementById("stage-img");
+        const stageMeta = document.getElementById("stage-meta");
+        document.querySelectorAll(".seg-btn[data-src]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            document.querySelectorAll(".seg-btn[data-src]").forEach((b) => b.setAttribute("aria-selected", "false"));
+            btn.setAttribute("aria-selected", "true");
+            stageImg.src = btn.dataset.src;
+            stageImg.alt = btn.dataset.alt;
+            stageMeta.textContent = btn.dataset.meta;
+          });
+        });
+
+        // 3. Replay Buffer & RAM Calculator (uses exact suicap-core config.rs piecewise table)
+        const TABLE = [
+          [1920 * 1080 * 60, 20],
+          [2560 * 1440 * 60, 30],
+          [2560 * 1440 * 120, 45],
+          [3840 * 2160 * 60, 50],
+          [3840 * 2160 * 120, 80],
+        ];
+        const FACTOR = { av1: 0.8, hevc: 1.0, h264: 1.5 };
+
+        function calcMbps(w, h, fps, codec) {
+          const rate = w * h * fps;
+          let hevc = TABLE[4][1] * (rate / TABLE[4][0]);
+          for (let i = 0; i < TABLE.length; i++) {
+            if (rate <= TABLE[i][0]) {
+              if (i === 0) {
+                hevc = TABLE[0][1] * (rate / TABLE[0][0]);
+              } else {
+                const [r0, b0] = TABLE[i - 1];
+                const [r1, b1] = TABLE[i];
+                hevc = b0 + ((b1 - b0) * (rate - r0)) / (r1 - r0);
+              }
+              break;
+            }
+          }
+          return Math.max(1, Math.round(hevc * FACTOR[codec]));
+        }
+
+        let preset = "high";
+        let fmt = "MKV";
+        const bufSlider = document.getElementById("buf-slider");
+        const bufLabel = document.getElementById("buf-label");
+        const customPanel = document.getElementById("custom-panel");
+        const simRes = document.getElementById("sim-res");
+        const simFps = document.getElementById("sim-fps");
+        const simCodec = document.getElementById("sim-codec");
+        const simRam = document.getElementById("sim-ram");
+        const ramCaption = document.getElementById("ram-caption");
+        const simSpecTag = document.getElementById("sim-spec-tag");
+        const fmtNote = document.getElementById("fmt-note");
+        const simBadge = document.getElementById("sim-badge");
+        const simBadgeText = document.getElementById("sim-badge-text");
+
+        function updateSim() {
+          const secs = Number(bufSlider.value);
+          const mins = secs >= 60 ? `${(secs / 60).toFixed(secs % 60 === 0 ? 0 : 1)} min (${secs} s)` : `${secs} s`;
+          bufLabel.textContent = mins;
+
+          let w = 2560, h = 1440, fps = 60, codec = "av1";
+          if (preset === "compat") {
+            w = 1920; h = 1080; fps = 60; codec = "h264";
+          } else if (preset === "balanced") {
+            w = 1920; h = 1080; fps = 60; codec = "av1";
+          } else if (preset === "high") {
+            w = 2560; h = 1440; fps = 60; codec = "av1";
+          } else {
+            const parts = simRes.value.split("x").map(Number);
+            w = parts[0]; h = parts[1];
+            fps = Number(simFps.value);
+            codec = simCodec.value;
+          }
+
+          const mbps = calcMbps(w, h, fps, codec);
+          const mb = Math.round((mbps * secs) / 8);
+          simRam.textContent = mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`;
+          ramCaption.textContent = `Up to ${mb} MB of memory at the maximum bitrate (${mbps} Mbps ${codec.toUpperCase()}).`;
+          simSpecTag.textContent = `${codec}_nvenc · ${w}×${h} @ ${fps} fps`;
+
+          if (!simBadge.classList.contains("saved")) {
+            simBadgeText.textContent = `REPLAY · ${secs} s`;
+          }
+        }
+
+        document.querySelectorAll(".preset-card").forEach((card) => {
+          card.addEventListener("click", () => {
+            preset = card.dataset.preset;
+            document.querySelectorAll(".preset-card").forEach((c) => c.setAttribute("aria-pressed", String(c === card)));
+            customPanel.hidden = preset !== "custom";
+            updateSim();
+          });
+        });
+
+        [bufSlider, simRes, simFps, simCodec].forEach((el) => el.addEventListener("input", updateSim));
+
+        document.querySelectorAll(".fmt-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            fmt = btn.dataset.fmt;
+            document.querySelectorAll(".fmt-btn").forEach((b) => b.setAttribute("aria-selected", String(b === btn)));
+            fmtNote.textContent =
+              fmt === "MKV"
+                ? "MKV preserves named audio tracks (Mix, Mic, Game, Voice, Media) in mpv and VLC using Opus audio."
+                : "MP4 plays everywhere using AAC audio tracks compatible with browsers and mobile editors.";
+          });
+        });
+
+        let saveTimer = null;
+        document.querySelectorAll(".save-trigger").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const val = btn.dataset.save === "full" ? bufSlider.value : btn.dataset.save;
+            simBadge.classList.add("saved");
+            simBadgeText.textContent = `CLIP SAVED · ${val} s`;
+            clearTimeout(saveTimer);
+            saveTimer = setTimeout(() => {
+              simBadge.classList.remove("saved");
+              updateSim();
+            }, 2400);
+          });
+        });
+
+        updateSim();
+
+        // 4. Interactive 5-Track Audio Routing Board
+        const tracks = { mix: true, mic: true, game: true, voice: true, media: true };
+        const apps = [
+          { id: "horizon", name: "Horizon", letter: "H", color: "#d96b1f", slot: "game" },
+          { id: "discord", name: "Discord", letter: "D", color: "#5865f2", slot: "voice" },
+          { id: "spotify", name: "Spotify", letter: "S", color: "#1db954", slot: "media" },
+          { id: "chrome", name: "Chrome", letter: "C", color: "#e69f00", slot: "media" },
+          { id: "steam", name: "Steam", letter: "S", color: "#5c6370", slot: "ignored" },
+        ];
+        const cycleOrder = ["game", "voice", "media", "ignored"];
+
+        function renderAudio() {
+          ["game", "voice", "media", "ignored"].forEach((slot) => {
+            const host = document.getElementById(`slot-${slot}`);
+            host.innerHTML = "";
+            apps
+              .filter((a) => a.slot === slot)
+              .forEach((app) => {
+                const btn = document.createElement("button");
+                btn.type = "button";
+                btn.className = "app-pill";
+                btn.title = "Click to move app to next track";
+                btn.innerHTML = `<span class="app-pill-left"><span class="app-badge" style="background:${app.color}">${app.letter}</span><span>${app.name}</span></span><span class="mono" style="font-size:11px;color:var(--text-3)">move</span>`;
+                btn.addEventListener("click", () => {
+                  const nextIdx = (cycleOrder.indexOf(app.slot) + 1) % cycleOrder.length;
+                  app.slot = cycleOrder[nextIdx];
+                  renderAudio();
+                });
+                host.appendChild(btn);
+              });
+          });
+
+          const mutedNames = [];
+          Object.keys(tracks).forEach((k) => {
+            const on = tracks[k];
+            const card = document.querySelector(`.audio-card[data-track="${k}"]`);
+            const pill = document.querySelector(`.out-pill[data-pill="${k}"]`);
+            if (card) card.classList.toggle("is-muted", !on);
+            if (pill) pill.classList.toggle("muted", !on);
+            if (!on) mutedNames.push(k);
+          });
+
+          const note = document.getElementById("audio-status-note");
+          note.textContent = mutedNames.length
+            ? `Strict mute active (${mutedNames.join(", ")}) · Excluded from Mix & track`
+            : "All 5 tracks live · Click any app chip to reassign track";
+        }
+
+        document.querySelectorAll(".track-switch").forEach((sw) => {
+          sw.addEventListener("click", () => {
+            const t = sw.dataset.track;
+            tracks[t] = !tracks[t];
+            sw.setAttribute("aria-checked", String(tracks[t]));
+            renderAudio();
+          });
+        });
+
+        renderAudio();
+
+        // 5. Capture Source Mode & Interactive Corner Badge Stage
+        const sourceReadout = document.getElementById("source-readout");
+        document.querySelectorAll(".source-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            document.querySelectorAll(".source-btn").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+            if (sourceReadout) sourceReadout.textContent = btn.dataset.detail;
+          });
+        });
+
+        const cornerReadout = document.getElementById("corner-readout");
+        const cornerBadgePill = document.getElementById("corner-badge-pill");
+        function selectCorner(cornerName, posKey) {
+          document.querySelectorAll(".corner-btn, .corner-slot").forEach((el) => {
+            el.setAttribute("aria-pressed", String(el.dataset.pos === posKey));
+          });
+          if (cornerBadgePill) cornerBadgePill.setAttribute("data-pos", posKey);
+          if (cornerReadout) cornerReadout.textContent = `${cornerName} · Hidden from capture`;
+        }
+        document.querySelectorAll(".corner-btn, .corner-slot").forEach((btn) => {
+          btn.addEventListener("click", () => selectCorner(btn.dataset.corner, btn.dataset.pos));
+        });
+
+        // 6. Hotkey Selector & CLI Copy
+        const hkDetail = document.getElementById("hk-detail");
+        document.querySelectorAll(".hk-item").forEach((row) => {
+          row.addEventListener("click", () => {
+            document.querySelectorAll(".hk-item").forEach((r) => r.setAttribute("aria-selected", String(r === row)));
+            hkDetail.textContent = row.dataset.detail;
+          });
+        });
+
+        const copyBtn = document.getElementById("copy-cli");
+        copyBtn.addEventListener("click", async () => {
+          const text = document.getElementById("cli-code").textContent;
+          try {
+            await navigator.clipboard.writeText(text);
+            copyBtn.textContent = "Copied";
+            setTimeout(() => (copyBtn.textContent = "Copy commands"), 1800);
+          } catch {
+            copyBtn.textContent = "Select & Ctrl+C";
+          }
+        });
+
+        // 7. Latest Release Direct .exe Resolver (mirrors src-tauri/src/update.rs)
+        const REPO = "giran03/SuiCap";
+        const DOWNLOAD_PREFIX = `https://github.com/${REPO}/releases/download/`;
+        const downloadLinks = [...document.querySelectorAll("[data-download-exe]")];
+        let releaseSettled = false;
+
+        function applyExeUrl(url, fileName, version) {
+          downloadLinks.forEach((link) => {
+            link.href = url;
+            link.dataset.resolvedExe = url;
+            if (fileName) link.setAttribute("download", fileName);
+            if (version) {
+              link.title = `Download SuiCap v${version} Windows installer (.exe)`;
+            }
+          });
+        }
+
+        const releasePromise = (async () => {
+          try {
+            const headers = { Accept: "application/vnd.github+json" };
+            let data = null;
+            const latestRes = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers });
+            if (latestRes.ok) {
+              data = await latestRes.json();
+            } else {
+              const listRes = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=1`, { headers });
+              if (listRes.ok) {
+                const list = await listRes.json();
+                if (Array.isArray(list) && list.length > 0) data = list[0];
+              }
+            }
+            if (!data) return;
+            const tag = typeof data.tag_name === "string" ? data.tag_name.trim() : "";
+            const version = tag.replace(/^[vV]/, "");
+            if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) return;
+
+            const expectedName = `SuiCap_${version}_x64-setup.exe`;
+            const assets = Array.isArray(data.assets) ? data.assets : [];
+            const isSafeAsset = (a) =>
+              a &&
+              typeof a.name === "string" &&
+              typeof a.browser_download_url === "string" &&
+              a.browser_download_url.startsWith(DOWNLOAD_PREFIX);
+
+            const picked =
+              assets.find((a) => isSafeAsset(a) && a.name.toLowerCase() === expectedName.toLowerCase()) ||
+              assets.find((a) => isSafeAsset(a) && a.name.toLowerCase().endsWith("-setup.exe")) ||
+              assets.find((a) => isSafeAsset(a) && a.name.toLowerCase().endsWith(".exe"));
+
+            const exeUrl = picked
+              ? picked.browser_download_url
+              : `${DOWNLOAD_PREFIX}${encodeURIComponent(tag)}/${expectedName}`;
+            const exeName = picked ? picked.name : expectedName;
+            applyExeUrl(exeUrl, exeName, version);
+          } catch {
+            // Keep default latest/download/*.exe fallback URL
+          } finally {
+            releaseSettled = true;
+          }
+        })();
+
+        downloadLinks.forEach((link) => {
+          link.addEventListener("click", async (e) => {
+            if (releaseSettled) return;
+            e.preventDefault();
+            await Promise.race([releasePromise, new Promise((r) => setTimeout(r, 1200))]);
+            window.location.assign(link.href);
+          });
+        });
+
+        // 8. Scroll Reveal (IntersectionObserver)
+        const revealEls = document.querySelectorAll("[data-reveal]");
+        if ("IntersectionObserver" in window) {
+          revealEls.forEach((el) => el.setAttribute("data-reveal", "pending"));
+          const io = new IntersectionObserver(
+            (entries) => {
+              entries.forEach((e) => {
+                if (e.isIntersecting) {
+                  e.target.setAttribute("data-reveal", "visible");
+                  io.unobserve(e.target);
+                }
+              });
+            },
+            { threshold: 0.08 },
+          );
+          revealEls.forEach((el) => io.observe(el));
+        }
+      })();
+    </script>
+  </body>
+</html>

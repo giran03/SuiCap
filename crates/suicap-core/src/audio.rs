@@ -42,12 +42,15 @@ use windows::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
             },
-            Threading::{AvSetMmThreadCharacteristicsW, CreateEventW, GetCurrentProcessId, WaitForSingleObject},
+            Threading::{
+                AvSetMmThreadCharacteristicsW, CreateEventW, GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForSingleObject,
+            },
             Variant::VT_BLOB,
         },
         UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId},
     },
-    core::{HRESULT, IUnknown, Interface, PCWSTR, Ref, implement, w},
+    core::{HRESULT, IUnknown, Interface, PCWSTR, PWSTR, Ref, implement, w},
 };
 
 use crate::{
@@ -136,7 +139,16 @@ impl Timeline {
 
     /// Add `samples` (interleaved stereo) captured at `qpc_us` to `line`.
     pub fn push(&mut self, line: usize, qpc_us: i64, samples: &[f32]) {
-        let frames = (samples.len() / 2) as i64;
+        self.push_chunk(line, qpc_us, samples.len() / 2, samples);
+    }
+
+    /// Add `frames` stereo frames captured at `qpc_us` to `line`. An empty `samples` slice
+    /// represents digital silence (zero-allocated in the capture thread).
+    pub fn push_chunk(&mut self, line: usize, qpc_us: i64, frames: usize, samples: &[f32]) {
+        let frames = frames as i64;
+        if frames == 0 {
+            return;
+        }
         let expected = self.pos_of(qpc_us);
         let emit_pos = self.emit_pos;
         let l = &mut self.lines[line];
@@ -152,6 +164,16 @@ impl Timeline {
         let skip = (emit_pos - pos).clamp(0, frames);
         l.late_samples += skip as u64;
         let off = ((pos + skip - emit_pos) * 2) as usize;
+        if samples.is_empty() {
+            // Trailing silence needs no storage because `pop_into` and future writes pad with 0.0;
+            // only overwrite if a backward resync overlaps already-buffered audio.
+            let rem = ((frames - skip) * 2) as usize;
+            let end = (off + rem).min(l.pending.len());
+            for i in off..end {
+                l.pending[i] = 0.0;
+            }
+            return;
+        }
         if l.pending.len() < off {
             l.pending.resize(off, 0.0); // gap: silence
         }
@@ -168,22 +190,28 @@ impl Timeline {
         self.pos_of(now_us) - latency >= self.emit_pos + frame as i64
     }
 
+    /// Pop the next `frame` samples of every line into `out`, reusing existing Vec buffers.
+    pub fn pop_into(&mut self, frame: usize, out: &mut Vec<Vec<f32>>) -> i64 {
+        let pos = self.emit_pos;
+        let n = frame * 2;
+        if out.len() < self.lines.len() {
+            out.resize_with(self.lines.len(), || Vec::with_capacity(n));
+        }
+        for (dst, l) in out.iter_mut().zip(&mut self.lines) {
+            dst.clear();
+            let take = n.min(l.pending.len());
+            dst.extend(l.pending.drain(..take));
+            dst.resize(n, 0.0);
+        }
+        self.emit_pos += frame as i64;
+        pos
+    }
+
     /// Take the next `frame` samples of every line (silence where a line has none).
     /// Returns the frame's start position and one interleaved buffer per line.
     pub fn pop(&mut self, frame: usize) -> (i64, Vec<Vec<f32>>) {
-        let pos = self.emit_pos;
-        let n = frame * 2;
-        let out = self
-            .lines
-            .iter_mut()
-            .map(|l| {
-                let take = n.min(l.pending.len());
-                let mut v: Vec<f32> = l.pending.drain(..take).collect();
-                v.resize(n, 0.0);
-                v
-            })
-            .collect();
-        self.emit_pos += frame as i64;
+        let mut out = Vec::with_capacity(self.lines.len());
+        let pos = self.pop_into(frame, &mut out);
         (pos, out)
     }
 
@@ -405,8 +433,7 @@ impl AudioOptions {
                         .find(|p| p.exe.eq_ignore_ascii_case(exe))
                         .map_or((0, exe.to_owned()), |p| (p.pid, p.exe)),
                 ),
-                None => foreground_fullscreen_pid()
-                    .and_then(|pid| processes().into_iter().find(|p| p.pid == pid).map(|p| (pid, p.exe))),
+                None => foreground_fullscreen_pid().and_then(|pid| pid_exe(pid).map(|exe| (pid, exe))),
             })
             .flatten();
         let routes = route(s, foreground.clone());
@@ -474,7 +501,11 @@ fn route(s: &crate::config::AudioSettings, foreground: Option<(u32, String)>) ->
         && !is_muted(&exe)
     {
         // pid 0 = a chosen app that is not running yet: follow it by name
-        game.push(if pid == 0 { Target::Exe(exe.clone()) } else { Target::Pid(pid) });
+        game.push(if pid == 0 {
+            Target::Exe(exe.clone())
+        } else {
+            Target::Pid(pid)
+        });
         claimed.push(exe);
     }
     let voice = take(t.voice, &s.voice, &mut claimed);
@@ -504,15 +535,33 @@ fn live_targets(
     .collect()
 }
 
+/// Fast single-PID executable file name lookup via `OpenProcess` + `QueryFullProcessImageNameW`.
+pub fn pid_exe(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: handle is always closed before return; buffer is stack-owned for the call.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(h);
+        if !ok || len == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let name = std::path::Path::new(&path).file_name()?.to_string_lossy().into_owned();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
 /// Executable name without `.exe` of the foreground fullscreen app, for clip folders
 /// (plan §6.2); `None` on the desktop.
 pub fn foreground_app_name() -> Option<String> {
     let exe = match crate::targets::active_app() {
         Some(exe) => exe, // recording one application: its name, full screen or not
-        None => {
-            let pid = foreground_fullscreen_pid()?;
-            processes().into_iter().find(|p| p.pid == pid)?.exe
-        }
+        None => pid_exe(foreground_fullscreen_pid()?)?,
     };
     let stem = exe
         .strip_suffix(".exe")
@@ -524,8 +573,7 @@ pub fn foreground_app_name() -> Option<String> {
 /// Exe name (with `.exe`) of the full-screen app in front, for the status bar. The desktop
 /// shell covers the screen too, so it is not a game.
 pub fn foreground_game_exe() -> Option<String> {
-    let pid = foreground_fullscreen_pid()?;
-    let exe = processes().into_iter().find(|p| p.pid == pid)?.exe;
+    let exe = pid_exe(foreground_fullscreen_pid()?)?;
     const SHELL: [&str; 4] = [
         "explorer.exe",
         "searchhost.exe",
@@ -796,6 +844,7 @@ fn init_client(client: &IAudioClient, loopback: bool) -> Result<()> {
 struct Chunk {
     line: usize,
     qpc_us: i64,
+    frames: usize,
     samples: Vec<f32>,
 }
 
@@ -871,7 +920,7 @@ fn spawn_source(client: IAudioClient, key: SourceKey, line: usize, tx: Sender<Ch
                         }
                         let n = frames as usize * 2;
                         let samples = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
-                            vec![0.0; n]
+                            Vec::new()
                         } else {
                             std::slice::from_raw_parts(data as *const f32, n).to_vec()
                         };
@@ -881,7 +930,15 @@ fn spawn_source(client: IAudioClient, key: SourceKey, line: usize, tx: Sender<Ch
                         } else {
                             (qpc / 10) as i64 // 100 ns units on the QPC timeline
                         };
-                        if tx.send(Chunk { line, qpc_us, samples }).is_err() {
+                        if tx
+                            .send(Chunk {
+                                line,
+                                qpc_us,
+                                frames: frames as usize,
+                                samples,
+                            })
+                            .is_err()
+                        {
                             flag.store(true, Ordering::Release);
                             break;
                         }
@@ -973,6 +1030,9 @@ struct Mixer {
     foreground: Option<(u32, String)>,
     routes_rev: u64,
     chunk_tx: Sender<Chunk>,
+    lines_buf: Vec<Vec<f32>>,
+    tracks_buf: Vec<Vec<f32>>,
+    mix_buf: Vec<f32>,
     stats: AudioStats,
 }
 
@@ -1055,6 +1115,9 @@ impl AudioPath {
             foreground: opts.foreground.clone(),
             routes_rev: opts.live.routes_rev(),
             chunk_tx,
+            lines_buf: Vec::new(),
+            tracks_buf: vec![vec![0.0f32; frame * 2]; tracks.len()],
+            mix_buf: vec![0.0f32; frame * 2],
             stats: AudioStats {
                 tracks: tracks
                     .iter()
@@ -1240,9 +1303,9 @@ impl Mixer {
             let stopping = stop.load(Ordering::Acquire);
             match rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(c) => {
-                    self.timeline.push(c.line, c.qpc_us, &c.samples);
+                    self.timeline.push_chunk(c.line, c.qpc_us, c.frames, &c.samples);
                     while let Ok(c) = rx.try_recv() {
-                        self.timeline.push(c.line, c.qpc_us, &c.samples);
+                        self.timeline.push_chunk(c.line, c.qpc_us, c.frames, &c.samples);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1291,11 +1354,14 @@ impl Mixer {
 
     /// Sum lines into tracks, build the limited Mix, encode every track at the same PTS.
     fn emit_frame(&mut self, frame: usize, out: &mut Vec<Packet>) -> Result<()> {
-        let (pos, lines) = self.timeline.pop(frame);
+        let pos = self.timeline.pop_into(frame, &mut self.lines_buf);
         let n = frame * 2;
-        let mut tracks = vec![vec![0.0f32; n]; self.tracks.len()];
-        for (li, samples) in lines.iter().enumerate() {
-            let t = &mut tracks[self.line_track[li]];
+        for t in &mut self.tracks_buf {
+            t.clear();
+            t.resize(n, 0.0);
+        }
+        for (li, samples) in self.lines_buf[..self.timeline.lines()].iter().enumerate() {
+            let t = &mut self.tracks_buf[self.line_track[li]];
             for (d, s) in t.iter_mut().zip(samples) {
                 *d += s;
             }
@@ -1304,25 +1370,32 @@ impl Mixer {
         // so a muted app is gone from its own track and from the Mix.
         for (i, kind) in self.tracks.iter().enumerate() {
             if !matches!(kind, TrackKind::Mix | TrackKind::Desktop) {
-                ramp(&mut tracks[i], &mut self.gains[i], f32::from(self.live.audible(*kind)));
+                ramp(
+                    &mut self.tracks_buf[i],
+                    &mut self.gains[i],
+                    f32::from(self.live.audible(*kind)),
+                );
             }
         }
         if let Some(mix_i) = self.tracks.iter().position(|t| *t == TrackKind::Mix) {
-            let mut mix = vec![0.0f32; n];
-            for (_, t) in tracks.iter().enumerate().filter(|(i, _)| *i != mix_i) {
-                for (d, s) in mix.iter_mut().zip(t) {
-                    *d += s;
+            self.mix_buf.clear();
+            self.mix_buf.resize(n, 0.0);
+            for (i, t) in self.tracks_buf.iter().enumerate() {
+                if i != mix_i {
+                    for (d, s) in self.mix_buf.iter_mut().zip(t) {
+                        *d += s;
+                    }
                 }
             }
-            mix.iter_mut().for_each(|s| *s = soft_limit(*s));
+            self.mix_buf.iter_mut().for_each(|s| *s = soft_limit(*s));
             ramp(
-                &mut mix,
+                &mut self.mix_buf,
                 &mut self.gains[mix_i],
                 f32::from(self.live.audible(TrackKind::Mix)),
             );
-            tracks[mix_i] = mix;
+            std::mem::swap(&mut self.tracks_buf[mix_i], &mut self.mix_buf);
         }
-        for (i, (enc, samples)) in self.encoders.iter_mut().zip(&tracks).enumerate() {
+        for (i, (enc, samples)) in self.encoders.iter_mut().zip(&self.tracks_buf).enumerate() {
             if let Some(enc) = enc {
                 enc.encode(samples, pos, self.stream_ix[i], out)?;
             }
@@ -1675,5 +1748,22 @@ mod tests {
             Target::Pid(99),
         ];
         assert_eq!(resolve(&t, &procs), vec![10, 20]);
+    }
+
+    #[test]
+    fn silent_chunks_match_explicit_zeros_without_allocating() {
+        let mut silent = Timeline::new(START);
+        let ls = silent.add_line();
+        silent.push_chunk(ls, us(0), 480, &[]);
+        silent.push_chunk(ls, us(480), 480, &chunk(480, 0.5));
+        silent.push_chunk(ls, us(960), 480, &[]);
+
+        let mut explicit = Timeline::new(START);
+        let le = explicit.add_line();
+        explicit.push(le, us(0), &chunk(480, 0.0));
+        explicit.push(le, us(480), &chunk(480, 0.5));
+        explicit.push(le, us(960), &chunk(480, 0.0));
+
+        assert_eq!(silent.pop(1_440), explicit.pop(1_440));
     }
 }

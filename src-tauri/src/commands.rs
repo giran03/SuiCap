@@ -115,6 +115,7 @@ pub fn config_set(app: AppHandle, settings: Settings) -> CmdResult<Status> {
     }
     let _ = tauri::Emitter::emit(&app, "settings", &settings);
     crate::badge::sync(&app);
+    crate::tray::notify_menu_changed();
     // Track switches the session can honour take effect now, with no restart.
     state.apply_live(&settings.audio);
     let started = state.status().audio_live;
@@ -186,11 +187,15 @@ pub fn estimate_mb(settings: Settings) -> u64 {
     config::buffer_ram_estimate_mb(preset.max_bitrate_mbps(codec), settings.buffer_secs.min(600))
 }
 
-#[tauri::command]
-pub fn open_clips_folder(state: State<'_, AppState>) -> CmdResult<()> {
+pub fn open_clips_dir(state: &AppState) -> CmdResult<()> {
     let dir = state.clips_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     explorer(&[dir.into_os_string()])
+}
+
+#[tauri::command]
+pub fn open_clips_folder(state: State<'_, AppState>) -> CmdResult<()> {
+    open_clips_dir(&state)
 }
 
 // ---- Clip library (plan §6.3). Every path is re-resolved inside the clips folder by
@@ -425,7 +430,11 @@ pub fn toggle_target_app(app: &AppHandle) {
         s.source.title = String::new();
         format!("Recording only {}", w.exe)
     } else {
-        crate::feedback::notify(app, "Record the app in front", "There is no app window in front to record.");
+        crate::feedback::notify(
+            app,
+            "Record the app in front",
+            "There is no app window in front to record.",
+        );
         return;
     };
     match config_set(app.clone(), s) {
@@ -443,10 +452,18 @@ pub async fn foreground_game() -> Option<String> {
         .flatten()
 }
 
+static ICON_CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// Frees cached app icon data URLs when Settings closes.
+pub fn clear_icon_cache() {
+    if let Ok(mut g) = ICON_CACHE.lock() {
+        *g = None;
+    }
+}
+
 /// An app's icon as a PNG data URL; `None` when it cannot be found. Found icons are cached.
 #[tauri::command]
 pub async fn app_icon(exe: String) -> CmdResult<Option<String>> {
-    static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
     let ok = (5..=64).contains(&exe.len())
         && exe.to_ascii_lowercase().ends_with(".exe")
         && !exe.chars().any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c));
@@ -454,7 +471,7 @@ pub async fn app_icon(exe: String) -> CmdResult<Option<String>> {
         return Err("not a program file name".into());
     }
     let key = exe.to_ascii_lowercase();
-    if let Some(hit) = CACHE
+    if let Some(hit) = ICON_CACHE
         .lock()
         .ok()
         .and_then(|c| c.as_ref().and_then(|m| m.get(&key).cloned()))
@@ -466,7 +483,7 @@ pub async fn app_icon(exe: String) -> CmdResult<Option<String>> {
     })
     .await
     .map_err(|e| e.to_string())?;
-    if let (Some(u), Ok(mut c)) = (&url, CACHE.lock()) {
+    if let (Some(u), Ok(mut c)) = (&url, ICON_CACHE.lock()) {
         c.get_or_insert_with(HashMap::new).insert(key, u.clone());
     }
     Ok(url)
@@ -475,16 +492,6 @@ pub async fn app_icon(exe: String) -> CmdResult<Option<String>> {
 #[tauri::command]
 pub fn open_settings(app: AppHandle) {
     tray::open_settings(&app);
-}
-
-/// Sent by the tray menu page once it has measured itself.
-#[tauri::command]
-pub fn menu_ready(window: WebviewWindow, width: f64, height: f64) -> CmdResult<()> {
-    if window.label() != tray::MENU {
-        return Err("not the menu window".into());
-    }
-    let (w, h) = (width.clamp(120.0, 480.0), height.clamp(40.0, 800.0));
-    tray::show_menu(&window, w, h).map_err(|e| e.to_string())
 }
 
 /// Fixed destinations only: the page names one, never supplies a URL.

@@ -3,7 +3,7 @@
   // user's badge settings. The shell excludes this window from capture and makes it
   // click-through; this page reports its own size so the window is exactly as wide as the text.
   import { onMount } from "svelte";
-  import { api, onBadgeIcon, onClipFlash, onSettings, onStatus, type Settings, type Status } from "./api";
+  import { api, onBadgeIcon, onClipFlash, onScreenshotFlash, onSettings, onStatus, type Settings, type Status } from "./api";
   import BadgeIcon from "./BadgeIcon.svelte";
 
   let status = $state<Status | null>(null);
@@ -16,22 +16,34 @@
     const s = Math.max(0, Math.floor(t));
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   };
-  // A saved clip takes over the label and timer for a few seconds, label setting or not.
-  let flash = $state<number | null>(null);
+  // A saved clip or screenshot takes over the label (and timer for clips) for a few seconds.
+  type Flash = { kind: "clip"; secs: number } | { kind: "screenshot" };
+  let flash = $state<Flash | null>(null);
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  function triggerFlash(next: Flash) {
+    flash = next;
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => (flash = null), 3500);
+  }
   const flashing = $derived(flash !== null && Boolean(cfg?.badge_clip_flash));
   const time = $derived(
     flashing
-      ? `${Math.max(1, Math.round(flash ?? 0))} s`
+      ? flash?.kind === "clip"
+        ? `${Math.max(1, Math.round(flash.secs))} s`
+        : ""
       : recording
         ? clock(status?.recording_secs ?? 0)
         : `${Math.round(status?.buffered_secs ?? 0)} s`,
   );
   const label = $derived(
-    flashing ? "CLIP SAVED" : ((recording ? cfg?.badge_label_rec : cfg?.badge_label_replay) ?? ""),
+    flashing
+      ? flash?.kind === "screenshot"
+        ? "SCREENSHOT SAVED"
+        : "CLIP SAVED"
+      : ((recording ? cfg?.badge_label_rec : cfg?.badge_label_replay) ?? ""),
   );
   const showLabel = $derived(flashing || Boolean(cfg?.badge_show_label && label.trim()));
-  const showTime = $derived(flashing || Boolean(cfg?.badge_show_time));
+  const showTime = $derived(flashing ? flash?.kind === "clip" : Boolean(cfg?.badge_show_time));
   const showIcon = $derived(cfg?.badge_icon !== "none");
   /** With everything switched off the badge would be empty, so the dot stays. */
   const fallbackIcon = $derived(!showIcon && !showLabel && !showTime);
@@ -47,11 +59,8 @@
     const loadIcon = () => api.badgeIconData().then((d) => (iconSrc = d)).catch(() => (iconSrc = null));
     loadIcon();
     const offs = [
-      onClipFlash((secs) => {
-        flash = secs;
-        clearTimeout(flashTimer);
-        flashTimer = setTimeout(() => (flash = null), 3500);
-      }),
+      onClipFlash((secs) => triggerFlash({ kind: "clip", secs })),
+      onScreenshotFlash(() => triggerFlash({ kind: "screenshot" })),
       onStatus((s) => (status = s)), onSettings((c) => (cfg = c)), onBadgeIcon(loadIcon),
     ];
     return () => {

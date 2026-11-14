@@ -737,7 +737,9 @@ mod tests {
         assert!(bad(|s| s.audio.mic_device = Some("x".repeat(201))));
         // a recorded application must be a plain program name
         assert!(bad(|s| (s.source.kind, s.source.exe) = (SourceKind::App, String::new())));
-        assert!(bad(|s| (s.source.kind, s.source.exe) = (SourceKind::App, "a/b.exe".into())));
+        assert!(bad(
+            |s| (s.source.kind, s.source.exe) = (SourceKind::App, "a/b.exe".into())
+        ));
         assert!(bad(|s| (s.source.kind, s.source.exe) = (SourceKind::App, "game".into())));
         assert!(bad(|s| s.source.title = "x".repeat(201)));
         assert!(bad(

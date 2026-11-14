@@ -7,8 +7,8 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<header
-  data-tauri-drag-region
+<div
+  class="win-btns"
   oncontextmenu={(e) =>
     showMenu(e, [
       { label: "Minimize", run: () => win.minimize() },
@@ -21,16 +21,14 @@
   <button class="close" aria-label="Close" onclick={() => win.close()}>
     <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1l8 8M9 1l-8 8" /></svg>
   </button>
-</header>
+</div>
 
 <style>
-  header {
+  .win-btns {
     display: flex;
-    align-items: flex-start;
-    justify-content: flex-end;
-    height: 44px;
-    padding: 6px 8px 0 0;
+    align-items: center;
     gap: 2px;
+    flex: none;
   }
   button {
     display: grid;

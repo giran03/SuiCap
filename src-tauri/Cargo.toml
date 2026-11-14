@@ -20,8 +20,10 @@ tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_System_Power",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

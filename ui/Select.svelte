@@ -7,7 +7,7 @@
   import { backOut } from "svelte/easing";
   import AppIcon from "./AppIcon.svelte";
 
-  type Option = { value: T; label: string; sub?: string; badge?: string; disabled?: boolean; /** Show this program's icon. */ exe?: string };
+  type Option = { value: T; label: string; sub?: string; tag?: string; badge?: string; disabled?: boolean; /** Show this program's icon. */ exe?: string };
 
   let {
     options,
@@ -154,6 +154,7 @@
   onkeydown={onTriggerKey}
 >
   {#if current?.exe}<AppIcon exe={current.exe} size={20} />{/if}
+  {#if current?.tag}<span class="tag">{current.tag}</span>{/if}
   <span class="cur">
     <span class="cur-label">{current?.label ?? "Choose…"}</span>
     {#if current?.sub}<span class="cur-sub">{current.sub}</span>{/if}
@@ -189,6 +190,7 @@
         onclick={() => pick(i)}
       >
         {#if o.exe}<AppIcon exe={o.exe} size={22} />{/if}
+        {#if o.tag}<span class="tag">{o.tag}</span>{/if}
         <span class="txt">
           <span class="lbl">{o.label}</span>
           {#if o.sub}<span class="sub">{o.sub}</span>{/if}
@@ -246,6 +248,7 @@
   }
   .cur {
     display: flex;
+    flex: 1;
     min-width: 0;
     flex-direction: column;
     line-height: 1.2;
@@ -337,6 +340,22 @@
     color: var(--text-3);
     font-size: 11px;
     font-weight: 500;
+  }
+  .tag {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 6px;
+    background: var(--surface-3);
+    color: var(--text-2);
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+    font-variant-numeric: tabular-nums;
+  }
+  .opt.chosen .tag,
+  .sel.open .tag {
+    background: var(--accent-soft);
+    color: var(--accent);
   }
   .badge {
     flex: none;

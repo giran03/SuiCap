@@ -173,14 +173,25 @@ fn scan_roots() -> Vec<Root> {
     roots
 }
 
+/// Drops cached Start Menu/install-folder and seen-app maps when Settings closes so
+/// background tray operation holds zero app-discovery memory.
+pub fn clear_caches() {
+    if let Ok(mut g) = INSTALLED.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = SEEN.lock() {
+        *g = None;
+    }
+}
+
 /// Every `.exe` under the usual install folders, name (lowercase) -> path. Cached for a couple
-/// of minutes because walking Program Files takes a moment.
-fn installed_index() -> HashMap<String, PathBuf> {
+/// of minutes because walking Program Files takes a moment, queried in-place without cloning.
+fn with_installed_index<R>(f: impl FnOnce(&HashMap<String, PathBuf>) -> R) -> R {
     if let Ok(g) = INSTALLED.lock()
         && let Some((at, map)) = g.as_ref()
         && at.elapsed() < SCAN_TTL
     {
-        return map.clone();
+        return f(map);
     }
     // One thread per folder: this is disk latency, not CPU.
     let mut map: HashMap<String, PathBuf> = HashMap::new();
@@ -204,10 +215,11 @@ fn installed_index() -> HashMap<String, PathBuf> {
             map.entry(k).or_insert(v);
         }
     }
+    let out = f(&map);
     if let Ok(mut g) = INSTALLED.lock() {
-        *g = Some((Instant::now(), map.clone()));
+        *g = Some((Instant::now(), map));
     }
-    map
+    out
 }
 
 fn walk(
@@ -244,7 +256,7 @@ fn walk(
 
 /// Start indexing the install folders in the background, so `present` is quick later.
 pub fn warm_up() {
-    std::thread::spawn(|| drop(installed_index()));
+    std::thread::spawn(|| with_installed_index(|_| ()));
 }
 
 /// Which of `exes` exist here: running right now, installed under a usual folder, or
@@ -256,18 +268,18 @@ pub fn present(exes: &[String]) -> Vec<String> {
         .collect();
     let wanted: Vec<String> = exes.iter().map(|e| e.to_ascii_lowercase()).collect();
     // Cheap answers first; the folder scan only runs for what is still unknown.
-    let unknown = |e: &&String| !running.contains(*e) && registered_path(e).is_none();
-    let rest: Vec<&String> = wanted.iter().filter(unknown).collect();
-    let index = if rest.is_empty() {
-        HashMap::new()
-    } else {
-        installed_index()
-    };
-    wanted
+    let need_index = wanted
         .iter()
-        .filter(|e| running.contains(*e) || index.contains_key(*e) || registered_path(e).is_some())
-        .cloned()
-        .collect()
+        .any(|e| !running.contains(e) && registered_path(e).is_none());
+    if !need_index {
+        return wanted;
+    }
+    with_installed_index(|index| {
+        wanted
+            .into_iter()
+            .filter(|e| running.contains(e) || index.contains_key(e) || registered_path(e).is_some())
+            .collect()
+    })
 }
 
 /// Exe name and full path of `pid`. Asks for PROCESS_QUERY_LIMITED_INFORMATION only, never
@@ -393,10 +405,8 @@ fn exe_path(exe: &str) -> Option<PathBuf> {
             return Some(PathBuf::from(path));
         }
     }
-    installed_index()
-        .get(&exe.to_ascii_lowercase())
-        .cloned()
-        .or_else(|| registered_path(exe))
+    let key = exe.to_ascii_lowercase();
+    with_installed_index(|m| m.get(&key).cloned()).or_else(|| registered_path(exe))
 }
 
 /// The App Paths registration of an installed program.
@@ -639,7 +649,7 @@ mod tests {
         println!(
             "[apps] scan {:?}, {} exes indexed",
             t0.elapsed(),
-            installed_index().len()
+            with_installed_index(HashMap::len)
         );
         assert_eq!(found, vec![me.to_ascii_lowercase()]);
     }

@@ -6,14 +6,14 @@
   import { flip } from "svelte/animate";
   import { fade, scale, slide } from "svelte/transition";
   import { backOut, cubicOut } from "svelte/easing";
-  import { api, type AudioApp, type InputDevice, type Settings } from "./api";
+  import { api, type AudioApp, type InputDevice, type Settings, type Status } from "./api";
   import AppIcon from "./AppIcon.svelte";
   import Toggle from "./Toggle.svelte";
   import Select from "./Select.svelte";
   import { friendlyName, rememberNames } from "./icons";
   import { copyText, showMenu, type MenuItem } from "./menu-state.svelte";
 
-  let { s, edit }: { s: Settings; edit: (f: (d: Settings) => void, delay?: number) => void } = $props();
+  let { s, status = null, edit }: { s: Settings; status?: Status | null; edit: (f: (d: Settings) => void, delay?: number) => void } = $props();
 
   type ListKey = "game" | "voice" | "media" | "ignored";
   const LISTS: ListKey[] = ["game", "voice", "media", "ignored"];
@@ -62,6 +62,13 @@
 
   // App tracks that are off: their apps are muted (captured nowhere, not even in the Mix).
   const mutedTracks = $derived(appTracks.filter((t) => !s.audio.tracks[t.id]).map((t) => t.title));
+
+  // When the Game list is empty, show the currently captured window/fullscreen process.
+  const autoGame = $derived(
+    s.audio.game.length === 0 && status?.capture_target.kind === "window" && status.capture_target.exe
+      ? status.capture_target.exe
+      : null,
+  );
 
   // ---- Microphones ----
   // The list follows the system: it reloads when the page opens, on a timer, when the window
@@ -375,7 +382,21 @@
         {@render chip(exe, k)}
       </span>
     {:else}
-      {#if present}<span class="empty" transition:fade={{ duration: 120 }}>{hint}</span>{/if}
+      {#if k === "game" && autoGame}
+        <span
+          class="chip auto"
+          role="listitem"
+          title="{autoGame} — automatically captured"
+          in:scale={{ duration: 280, start: 0.7, easing: backOut }}
+          out:fade={{ duration: 120 }}
+        >
+          <AppIcon exe={autoGame} size={18} />
+          <span class="chip-name">{friendlyName(autoGame)}</span>
+          <span class="chip-tag">Auto</span>
+        </span>
+      {:else if present}
+        <span class="empty" transition:fade={{ duration: 120 }}>{hint}</span>
+      {/if}
     {/each}
     {#if addTo === k}
       <input
@@ -481,7 +502,7 @@
         <header>
           <span class="tile"><svg viewBox="0 0 24 24" aria-hidden="true"><path d={t.icon} /></svg></span>
           <div class="t-title">{t.title}</div>
-          <span class="count">{visible(t.id).length}</span>
+          <span class="count">{visible(t.id).length + (t.id === "game" && autoGame ? 1 : 0)}</span>
           <Toggle {on} label="{t.title} track" onchange={(v) => setTrack(t.id, v)} />
         </header>
         <p class="t-desc">{t.desc}</p>
@@ -970,6 +991,24 @@
   }
   .chip:hover {
     background: var(--line-strong);
+  }
+  .chip.auto {
+    cursor: default;
+    padding: 3px 7px;
+    background: color-mix(in srgb, var(--c) 14%, var(--surface-3));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 35%, transparent);
+  }
+  .chip.auto:hover {
+    background: color-mix(in srgb, var(--c) 18%, var(--surface-3));
+  }
+  .chip-tag {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--c) 22%, transparent);
+    color: var(--c);
+    font-size: 10.5px;
+    font-weight: 650;
   }
   .chip-name {
     flex: 1;

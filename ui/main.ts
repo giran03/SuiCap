@@ -3,7 +3,6 @@ import { mount } from "svelte";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, onSettings, type Theme } from "./api";
 import Settings from "./Settings.svelte";
-import Menu from "./Menu.svelte";
 import Badge from "./Badge.svelte";
 import { mountTooltips } from "./tooltip";
 
@@ -23,7 +22,7 @@ if (import.meta.env.PROD) {
 const media = window.matchMedia("(prefers-color-scheme: light)");
 let theme: Theme = "system";
 
-/** Apply the stored theme to this page (both windows share theme.css tokens). */
+/** Apply the stored theme to this page (uses theme.css tokens). */
 function applyTheme(t: Theme) {
   theme = t;
   const light = t === "light" || (t === "system" && media.matches);
@@ -42,16 +41,11 @@ async function start() {
   applyTheme(settings.theme);
   onSettings((s) => applyTheme(s.theme));
   const target = document.getElementById("app")!;
-  if (win.label === "menu") {
-    document.documentElement.classList.add("menu-window");
-    mount(Menu, { target });
-  } else {
-    mount(Settings, { target, props: { initial: settings } });
-    mountTooltips();
-    await win.setTheme(settings.theme === "system" ? null : settings.theme);
-    await win.show();
-    await win.setFocus();
-  }
+  mount(Settings, { target, props: { initial: settings } });
+  mountTooltips();
+  await win.setTheme(settings.theme === "system" ? null : settings.theme);
+  await win.show();
+  await win.setFocus();
 }
 
 start();

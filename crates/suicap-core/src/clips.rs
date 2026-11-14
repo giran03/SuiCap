@@ -329,40 +329,42 @@ pub fn thumbnail(root: &Path, path: &Path, size: u32) -> Result<String, String> 
         }
         (w as u32, h as u32, buf)
     };
-    let mut rgba = bgra;
-    for px in rgba.chunks_exact_mut(4) {
-        px.swap(0, 2);
-        px[3] = 255;
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for px in bgra.chunks_exact(4) {
+        rgb.push(px[2]);
+        rgb.push(px[1]);
+        rgb.push(px[0]);
     }
-    let (rgba, w, h) = shrink(&rgba, w, h, 320);
+    drop(bgra);
+    let (rgb, w, h) = shrink(&rgb, w, h, 320);
     let mut png_bytes = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut png_bytes, w, h);
-        enc.set_color(png::ColorType::Rgba);
+        enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
         enc.set_compression(png::Compression::Fast);
         let mut writer = enc.write_header().map_err(|e| e.to_string())?;
-        writer.write_image_data(&rgba).map_err(|e| e.to_string())?;
+        writer.write_image_data(&rgb).map_err(|e| e.to_string())?;
         writer.finish().map_err(|e| e.to_string())?;
     }
     Ok(base64(&png_bytes))
 }
 
-/// Box-filter downscale by a whole factor so the width is at most `max_w`.
-fn shrink(rgba: &[u8], w: u32, h: u32, max_w: u32) -> (Vec<u8>, u32, u32) {
+/// Box-filter downscale (RGB8) by a whole factor so the width is at most `max_w`.
+fn shrink(rgb: &[u8], w: u32, h: u32, max_w: u32) -> (Vec<u8>, u32, u32) {
     let k = w.div_ceil(max_w).max(1);
     if k == 1 {
-        return (rgba.to_vec(), w, h);
+        return (rgb.to_vec(), w, h);
     }
     let (nw, nh) = ((w / k).max(1), (h / k).max(1));
-    let mut out = Vec::with_capacity((nw * nh * 4) as usize);
+    let mut out = Vec::with_capacity((nw * nh * 3) as usize);
     for y in 0..nh {
         for x in 0..nw {
-            let mut acc = [0u32; 4];
+            let mut acc = [0u32; 3];
             for dy in 0..k {
                 for dx in 0..k {
-                    let i = (((y * k + dy) * w + x * k + dx) * 4) as usize;
-                    for (a, v) in acc.iter_mut().zip(&rgba[i..i + 4]) {
+                    let i = (((y * k + dy) * w + x * k + dx) * 3) as usize;
+                    for (a, v) in acc.iter_mut().zip(&rgb[i..i + 3]) {
                         *a += u32::from(*v);
                     }
                 }
@@ -521,15 +523,9 @@ mod tests {
 
     #[test]
     fn shrink_halves_and_averages() {
-        let px = [
-            [0u8, 0, 0, 255],
-            [100, 100, 100, 255],
-            [100, 100, 100, 255],
-            [200, 200, 200, 255],
-        ]
-        .concat();
+        let px = [[0u8, 0, 0], [100, 100, 100], [100, 100, 100], [200, 200, 200]].concat();
         let (out, w, h) = shrink(&px, 2, 2, 1);
-        assert_eq!((w, h, out), (1, 1, vec![100, 100, 100, 255]));
+        assert_eq!((w, h, out), (1, 1, vec![100, 100, 100]));
     }
 
     #[test]

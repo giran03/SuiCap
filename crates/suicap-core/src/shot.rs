@@ -1,6 +1,6 @@
 //! One-off screenshot (plan §6.3): the sole place a video frame is read back to the CPU
 //! (rule 1 exception). It copies the newest converted NV12 frame to a staging texture,
-//! converts it to RGBA (BT.709 limited, as encoded) and writes a PNG on a worker thread.
+//! converts it to RGB (BT.709 limited, as encoded) and writes a PNG on a worker thread.
 //! FFI module.
 
 use std::path::{Path, PathBuf};
@@ -22,11 +22,11 @@ pub enum ShotError {
     Empty,
 }
 
-/// Straight-alpha RGBA8, row-major.
+/// RGB8 pixels, row-major.
 pub struct Image {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgb: Vec<u8>,
 }
 
 /// Read `w`x`h` pixels of NV12 texture `tex` (array slice `slice`) back to the CPU.
@@ -72,30 +72,30 @@ pub fn read_nv12(
         let pitch = mapped.RowPitch as usize;
         let base = mapped.pData as *const u8;
         let plane = std::slice::from_raw_parts(base, pitch * desc.Height as usize * 3 / 2);
-        let image = nv12_to_rgba(plane, pitch, desc.Height as usize, w as usize, h as usize);
+        let image = nv12_to_rgb(plane, pitch, desc.Height as usize, w as usize, h as usize);
         ctx.Unmap(&staging, 0);
         image
     };
     Ok(Image {
         width: w,
         height: h,
-        rgba: image,
+        rgb: image,
     })
 }
 
 /// `plane`: Y rows (`pitch` bytes, `alloc_h` rows) followed by interleaved UV rows.
-fn nv12_to_rgba(plane: &[u8], pitch: usize, alloc_h: usize, w: usize, h: usize) -> Vec<u8> {
+fn nv12_to_rgb(plane: &[u8], pitch: usize, alloc_h: usize, w: usize, h: usize) -> Vec<u8> {
     let (y_plane, uv_plane) = plane.split_at(pitch * alloc_h);
-    let mut out = vec![255u8; w * h * 4];
+    let mut out = vec![0u8; w * h * 3];
     for row in 0..h {
         let y_row = &y_plane[row * pitch..row * pitch + w];
         let uv_row = &uv_plane[(row / 2) * pitch..(row / 2) * pitch + (w & !1).max(2).min(pitch)];
-        let o = &mut out[row * w * 4..(row + 1) * w * 4];
+        let o = &mut out[row * w * 3..(row + 1) * w * 3];
         for x in 0..w {
             let u = uv_row.get(x & !1).copied().unwrap_or(128);
             let v = uv_row.get((x & !1) + 1).copied().unwrap_or(128);
             let [r, g, b] = yuv709_limited(y_row[x], u, v);
-            o[x * 4..x * 4 + 3].copy_from_slice(&[r, g, b]);
+            o[x * 3..x * 3 + 3].copy_from_slice(&[r, g, b]);
         }
     }
     out
@@ -122,11 +122,11 @@ pub fn write_png(image: &Image, path: &Path) -> Result<PathBuf, ShotError> {
     let result = (|| -> Result<(), ShotError> {
         let file = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         let mut enc = png::Encoder::new(file, image.width, image.height);
-        enc.set_color(png::ColorType::Rgba);
+        enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
         enc.set_compression(png::Compression::Fast);
         let mut w = enc.write_header().map_err(|e| ShotError::Png(e.to_string()))?;
-        w.write_image_data(&image.rgba)
+        w.write_image_data(&image.rgb)
             .map_err(|e| ShotError::Png(e.to_string()))?;
         w.finish().map_err(|e| ShotError::Png(e.to_string()))?;
         Ok(())
@@ -158,9 +158,9 @@ mod tests {
         let (pitch, alloc_h) = (8, 2);
         let mut plane = vec![126u8; pitch * alloc_h];
         plane.extend(std::iter::repeat_n(128u8, pitch));
-        let out = nv12_to_rgba(&plane, pitch, alloc_h, 4, 2);
-        assert_eq!(out.len(), 4 * 2 * 4);
-        assert!(out.chunks(4).all(|p| p[3] == 255 && p[0] == p[1] && p[1] == p[2]));
+        let out = nv12_to_rgb(&plane, pitch, alloc_h, 4, 2);
+        assert_eq!(out.len(), 4 * 2 * 3);
+        assert!(out.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]));
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         let img = Image {
             width: 2,
             height: 2,
-            rgba: vec![255; 16],
+            rgb: vec![255; 12],
         };
         let path = write_png(&img, &dir.join("a.png")).unwrap();
         assert_eq!(&std::fs::read(&path).unwrap()[1..4], b"PNG");

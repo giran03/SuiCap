@@ -397,6 +397,7 @@ fn session(args: &[String]) -> Result<(), String> {
                 (c.last_pts_us - c.first_pts_us) as f64 / 1e6
             ),
             SessionEvent::RecordingFailed(m) => println!("[{t:8.1}] recording failed: {m}"),
+            SessionEvent::ScreenshotTaken(_) => {}
             SessionEvent::ScreenshotSaved(p) => println!("[{t:8.1}] screenshot {}", p.display()),
             SessionEvent::ScreenshotFailed(m) => println!("[{t:8.1}] screenshot failed: {m}"),
             SessionEvent::Recovering(m) => println!("[{t:8.1}] RECOVERING: {m}"),

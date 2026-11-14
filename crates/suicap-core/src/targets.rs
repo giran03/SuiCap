@@ -128,12 +128,7 @@ pub fn list_windows() -> Vec<WindowInfo> {
                 return true.into();
             }
             let mut cloaked = 0u32;
-            let _ = DwmGetWindowAttribute(
-                hwnd,
-                DWMWA_CLOAKED,
-                (&raw mut cloaked).cast(),
-                size_of::<u32>() as u32,
-            );
+            let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&raw mut cloaked).cast(), size_of::<u32>() as u32);
             if cloaked != 0 {
                 return true.into();
             }
@@ -174,12 +169,10 @@ pub fn list_windows() -> Vec<WindowInfo> {
 /// changed, e.g. a browser tab); among the rest the biggest one.
 pub fn pick_window<'a>(list: &'a [WindowInfo], exe: &str, title: &str) -> Option<&'a WindowInfo> {
     let title = title.trim().to_lowercase();
-    list.iter()
-        .filter(|w| w.exe.eq_ignore_ascii_case(exe))
-        .max_by_key(|w| {
-            let hit = !title.is_empty() && w.title.to_lowercase().contains(&title);
-            (hit, u64::from(w.width) * u64::from(w.height))
-        })
+    list.iter().filter(|w| w.exe.eq_ignore_ascii_case(exe)).max_by_key(|w| {
+        let hit = !title.is_empty() && w.title.to_lowercase().contains(&title);
+        (hit, u64::from(w.width) * u64::from(w.height))
+    })
 }
 
 /// Find the window for `exe` / `title` right now.
@@ -211,7 +204,7 @@ pub fn foreground_window(fullscreen_only: bool) -> Option<WindowInfo> {
                 return None;
             }
         }
-        let info = info_of(hwnd, &exe_lookup())?;
+        let info = info_of(hwnd, &crate::audio::pid_exe)?;
         (!is_shell(&info.exe) && info.width >= 100 && info.height >= 60).then_some(info)
     }
 }

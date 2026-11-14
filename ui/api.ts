@@ -169,6 +169,26 @@ export interface CodecSupport {
   problem: string | null;
 }
 
+let audioAppsInflight: Promise<AudioApp[]> | null = null;
+let audioAppsCache: { at: number; data: AudioApp[] } | null = null;
+
+function fetchAudioApps(): Promise<AudioApp[]> {
+  if (audioAppsCache && Date.now() - audioAppsCache.at < 2000) {
+    return Promise.resolve(audioAppsCache.data);
+  }
+  if (!audioAppsInflight) {
+    audioAppsInflight = invoke<AudioApp[]>("audio_apps")
+      .then((data) => {
+        audioAppsCache = { at: Date.now(), data };
+        return data;
+      })
+      .finally(() => {
+        audioAppsInflight = null;
+      });
+  }
+  return audioAppsInflight;
+}
+
 export const api = {
   status: () => invoke<Status>("status"),
   arm: () => invoke<void>("arm"),
@@ -186,13 +206,12 @@ export const api = {
   pickClipsDir: () => invoke<string | null>("pick_clips_dir"),
   foregroundGame: () => invoke<string | null>("foreground_game"),
   captureWindows: () => invoke<WindowInfo[]>("capture_windows"),
-  audioApps: () => invoke<AudioApp[]>("audio_apps"),
+  audioApps: fetchAudioApps,
   presentApps: (exes: string[]) => invoke<string[]>("present_apps", { exes }),
   revealApp: (exe: string) => invoke<void>("reveal_app", { exe }),
   audioInputs: () => invoke<InputDevice[]>("audio_inputs"),
   appIcon: (exe: string) => invoke<string | null>("app_icon", { exe }),
   openSettings: () => invoke<void>("open_settings"),
-  menuReady: (width: number, height: number) => invoke<void>("menu_ready", { width, height }),
   quit: () => invoke<void>("quit"),
   /** What the GPU behind the chosen monitor can encode (probed once, then cached). */
   codecSupport: (refresh = false) => invoke<CodecSupport>("codec_support", { refresh }),
@@ -241,6 +260,10 @@ export async function onClipsChanged(f: () => void): Promise<UnlistenFn> {
 /** A clip was saved; the payload is its length in seconds. */
 export function onClipFlash(f: (secs: number) => void): Promise<UnlistenFn> {
   return listen<number>("clip_flash", (e) => f(e.payload));
+}
+
+export function onScreenshotFlash(f: () => void): Promise<UnlistenFn> {
+  return listen("screenshot_flash", () => f());
 }
 
 export function onBadgeIcon(f: () => void): Promise<UnlistenFn> {

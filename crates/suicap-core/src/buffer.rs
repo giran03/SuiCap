@@ -5,21 +5,73 @@
 
 use std::{collections::VecDeque, sync::Mutex};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 /// Stream index of the video track; audio tracks use 1..
 pub const VIDEO_STREAM: u8 = 0;
 
+/// Chunk size for packing compressed packet payloads into shared backing buffers.
+const SLAB_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Bump-allocates immutable [`Bytes`] slices from 64 KB chunks so hundreds of packets
+/// per second share a few heap blocks instead of each allocating its own buffer.
+pub struct PacketSlab {
+    buf: BytesMut,
+}
+
+impl Default for PacketSlab {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PacketSlab {
+    pub fn new() -> Self {
+        Self {
+            buf: BytesMut::with_capacity(SLAB_CHUNK_BYTES),
+        }
+    }
+
+    pub fn copy_from_slice(&mut self, src: &[u8]) -> Bytes {
+        if src.is_empty() {
+            return Bytes::new();
+        }
+        if self.buf.capacity() - self.buf.len() < src.len() {
+            self.buf = BytesMut::with_capacity(src.len().max(SLAB_CHUNK_BYTES));
+        }
+        self.buf.extend_from_slice(src);
+        self.buf.split().freeze()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Packet {
+    pub data: Bytes,
+    pub pts_us: i64,
+    /// `dts_us - pts_us` fits in signed 32-bit microseconds (±35 min), keeping `Packet` 48 bytes.
+    pub dts_offset_us: i32,
     pub stream: u8,
     pub key: bool,
-    pub pts_us: i64,
-    pub dts_us: i64,
-    pub data: Bytes,
 }
 
 impl Packet {
+    pub fn new(stream: u8, key: bool, pts_us: i64, dts_us: i64, data: Bytes) -> Self {
+        let dts_offset_us = dts_us
+            .saturating_sub(pts_us)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        Self {
+            data,
+            pts_us,
+            dts_offset_us,
+            stream,
+            key,
+        }
+    }
+
+    pub fn dts_us(&self) -> i64 {
+        self.pts_us + i64::from(self.dts_offset_us)
+    }
+
     fn is_video_key(&self) -> bool {
         self.stream == VIDEO_STREAM && self.key
     }
@@ -94,6 +146,9 @@ impl ReplayBuffer {
             });
             g.bytes -= stale;
         }
+        if g.packets.capacity() > 1024 && g.packets.capacity() > g.packets.len().saturating_mul(4) {
+            g.packets.shrink_to_fit();
+        }
     }
 
     /// Packets from the last video keyframe at or before `newest - secs` to now. If the
@@ -149,13 +204,26 @@ mod tests {
     const SEC: i64 = 1_000_000;
 
     fn pkt(stream: u8, key: bool, pts_us: i64, len: usize) -> Packet {
-        Packet {
-            stream,
-            key,
-            pts_us,
-            dts_us: pts_us,
-            data: Bytes::from(vec![0u8; len]),
-        }
+        Packet::new(stream, key, pts_us, pts_us, Bytes::from(vec![0u8; len]))
+    }
+
+    #[test]
+    fn packet_layout_is_compact_and_preserves_dts() {
+        assert!(std::mem::size_of::<Packet>() <= 48);
+        let p = Packet::new(VIDEO_STREAM, false, 100_000, 83_333, Bytes::from_static(b"abc"));
+        assert_eq!(p.dts_us(), 83_333);
+    }
+
+    #[test]
+    fn packet_slab_packs_adjacent_slices_into_one_allocation() {
+        let mut slab = PacketSlab::new();
+        let a = slab.copy_from_slice(b"first");
+        let b = slab.copy_from_slice(b"second");
+        assert_eq!(&*a, b"first");
+        assert_eq!(&*b, b"second");
+        // SAFETY: both slices come from one 64 KB allocation chunk.
+        let dist = unsafe { b.as_ptr().offset_from(a.as_ptr()) };
+        assert_eq!(dist, 5);
     }
 
     /// `secs` of 10 fps video with a keyframe every second, plus one audio packet per frame.

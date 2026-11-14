@@ -72,11 +72,12 @@ pub fn clip_saved(app: &AppHandle, settings: &Settings, name: &str, secs: f64, t
     }
 }
 
-pub fn screenshot_saved(app: &AppHandle, settings: &Settings, name: &str) {
+/// `toast_ok` is false when the badge already announced the screenshot.
+pub fn screenshot_saved(app: &AppHandle, settings: &Settings, name: &str, toast_ok: bool) {
     if settings.save_sound {
         play_chime();
     }
-    if settings.save_toast {
+    if settings.save_toast && toast_ok {
         notify(app, "Screenshot saved", name);
     }
 }

@@ -118,6 +118,7 @@ fn place(app: &AppHandle, want: (BadgeCorner, Option<u32>, u32)) -> bool {
 fn build(app: &AppHandle) -> Option<WebviewWindow> {
     let window = WebviewWindowBuilder::new(app, BADGE, WebviewUrl::App("index.html".into()))
         .title("SuiCap recording")
+        .additional_browser_args(crate::tray::WEBVIEW_TRIM_ARGS)
         .inner_size(MEASURE_SIZE.0, MEASURE_SIZE.1)
         .position(-32000.0, -32000.0)
         .decorations(false)

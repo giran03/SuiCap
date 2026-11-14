@@ -53,12 +53,25 @@ export function dragscroll(node: HTMLElement) {
     node.scrollLeft = left0 - dx;
   }
 
+  let expectedTop = 0;
+  let expectedLeft = 0;
+  function stopGlide() {
+    cancelAnimationFrame(raf);
+    raf = 0;
+  }
   function glide() {
+    if (Math.abs(node.scrollTop - expectedTop) > 2 || Math.abs(node.scrollLeft - expectedLeft) > 2) {
+      raf = 0;
+      return;
+    }
     vy *= 0.94;
     vx *= 0.94;
     node.scrollTop += vy * 16;
     node.scrollLeft += vx * 16;
+    expectedTop = node.scrollTop;
+    expectedLeft = node.scrollLeft;
     if (Math.abs(vy) > 0.02 || Math.abs(vx) > 0.02) raf = requestAnimationFrame(glide);
+    else raf = 0;
   }
 
   function up(e: PointerEvent) {
@@ -68,7 +81,11 @@ export function dragscroll(node: HTMLElement) {
     node.classList.remove("grabbing");
     if (node.hasPointerCapture(e.pointerId)) node.releasePointerCapture(e.pointerId);
     // a flick that ended in a pause should not coast
-    if (e.timeStamp - lastT < 80) raf = requestAnimationFrame(glide);
+    if (e.timeStamp - lastT < 80) {
+      expectedTop = node.scrollTop;
+      expectedLeft = node.scrollLeft;
+      raf = requestAnimationFrame(glide);
+    }
   }
 
   /** A drag is not a click: swallow the one that follows. */
@@ -84,6 +101,7 @@ export function dragscroll(node: HTMLElement) {
   node.addEventListener("pointermove", move);
   node.addEventListener("pointerup", up);
   node.addEventListener("pointercancel", up);
+  node.addEventListener("wheel", stopGlide, { passive: true });
   node.addEventListener("click", click, true);
   return {
     destroy() {
@@ -92,6 +110,7 @@ export function dragscroll(node: HTMLElement) {
       node.removeEventListener("pointermove", move);
       node.removeEventListener("pointerup", up);
       node.removeEventListener("pointercancel", up);
+      node.removeEventListener("wheel", stopGlide);
       node.removeEventListener("click", click, true);
     },
   };

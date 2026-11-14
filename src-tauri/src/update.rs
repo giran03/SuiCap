@@ -33,8 +33,8 @@ use windows::{
 
 use crate::state::{AppState, Phase};
 
-/// GitHub `owner/name` the releases come from. Placeholder until the repository exists.
-pub const REPO: &str = "CafeTako/SuiCap";
+/// GitHub `owner/name` the releases come from.
+pub const REPO: &str = "giran03/SuiCap";
 pub const SUPPORT_EMAIL: &str = "support@cafetako.com";
 pub const COFFEE_URL: &str = "https://buymeacoffee.com/cafetako";
 pub const DEVELOPER: &str = "CafeTako";
@@ -42,7 +42,6 @@ pub const DEVELOPER: &str = "CafeTako";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SUMS_NAME: &str = "SHA256SUMS.txt";
 const FIRST_CHECK: Duration = Duration::from_secs(90);
-const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// Automatic installs wait until the PC has been left alone this long.
 const IDLE_BEFORE_INSTALL_S: u32 = 10 * 60;
 const EVENT: &str = "update";
@@ -159,22 +158,19 @@ fn now_secs() -> u64 {
 
 // ------------------------------------------------------------------ flow
 
-/// Background checks: shortly after launch, then every few hours while the mode allows it.
+/// Background check: runs once shortly after launch when the mode allows it.
 pub fn start(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(FIRST_CHECK);
-        loop {
-            let m = mode(&app);
-            if m != UpdateMode::Off
-                && let Some(release) = run_check(&app)
-                && m == UpdateMode::Auto
-                && run_download(&app, &release)
-                && wait_until_idle(&app)
-            {
-                run_install(&app);
-            }
-            std::thread::sleep(CHECK_EVERY);
+        let m = mode(&app);
+        if m != UpdateMode::Off
+            && let Some(release) = run_check(&app)
+            && m == UpdateMode::Auto
+            && run_download(&app, &release)
+            && wait_until_idle(&app)
+        {
+            run_install(&app);
         }
     });
 }

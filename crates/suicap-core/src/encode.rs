@@ -12,10 +12,8 @@ use windows::{
     core::Interface,
 };
 
-use bytes::Bytes;
-
 use crate::{
-    buffer::Packet,
+    buffer::{Packet, PacketSlab},
     capture::Vendor,
     config::{Codec, VideoPreset},
 };
@@ -207,6 +205,8 @@ impl EncoderSettings {
 
 pub struct Encoder {
     ctx: *mut ffi::AVCodecContext,
+    pkt: *mut ffi::AVPacket,
+    slab: PacketSlab,
     pub name: String,
     /// Options the encoder did not recognise (a wrong option table shows up here).
     pub unused_options: Vec<String>,
@@ -220,8 +220,8 @@ impl Encoder {
         }
         let name = encoder_name(s.vendor, s.codec).ok_or(EncodeError::Unsupported("unknown GPU vendor"))?;
         let cname = CString::new(name.clone()).expect("encoder names have no NUL");
-        // SAFETY: standard libavcodec open sequence; ctx owned by `Encoder` from the
-        // moment it is allocated so every early return frees it via Drop.
+        // SAFETY: standard libavcodec open sequence; ctx and pkt owned by `Encoder` from the
+        // moment they are allocated so every early return frees them via Drop.
         unsafe {
             let codec = ffi::avcodec_find_encoder_by_name(cname.as_ptr());
             if codec.is_null() {
@@ -231,11 +231,17 @@ impl Encoder {
             if ctx.is_null() {
                 return Err(EncodeError::Unsupported("avcodec_alloc_context3 returned NULL"));
             }
+            let pkt = ffi::av_packet_alloc();
             let mut enc = Encoder {
                 ctx,
+                pkt,
+                slab: PacketSlab::new(),
                 name,
                 unused_options: Vec::new(),
             };
+            if pkt.is_null() {
+                return Err(EncodeError::Unsupported("av_packet_alloc returned NULL"));
+            }
             let fps = s.preset.fps as i32;
             (*ctx).width = s.preset.width as i32;
             (*ctx).height = s.preset.height as i32;
@@ -284,8 +290,11 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        // SAFETY: we own the context; free also unrefs hw_frames_ctx.
-        unsafe { ffi::avcodec_free_context(&mut self.ctx) };
+        // SAFETY: we own both; free functions accept NULL and free also unrefs hw_frames_ctx.
+        unsafe {
+            ffi::av_packet_free(&mut self.pkt);
+            ffi::avcodec_free_context(&mut self.ctx);
+        }
     }
 }
 
@@ -362,39 +371,34 @@ impl Encoder {
         Ok(Sent::Accepted)
     }
 
-    /// Drain every ready packet into `out` (compressed bitstream, copied once into
-    /// `Bytes`; video frames themselves never leave the GPU). Returns false at EOF.
+    /// Drain every ready packet into `out` (compressed bitstream, packed once into the
+    /// packet slab; video frames themselves never leave the GPU). Returns false at EOF.
     pub fn receive(&mut self, stream: u8, out: &mut Vec<Packet>) -> Result<bool> {
-        // SAFETY: packet allocated and freed here; data valid until unref.
+        // SAFETY: self.pkt is a reusable owned packet; data is valid until av_packet_unref.
         unsafe {
-            let mut pkt = ffi::av_packet_alloc();
-            if pkt.is_null() {
-                return Err(EncodeError::Unsupported("av_packet_alloc returned NULL"));
-            }
-            let result = loop {
-                let ret = ffi::avcodec_receive_packet(self.ctx, pkt);
+            loop {
+                let ret = ffi::avcodec_receive_packet(self.ctx, self.pkt);
                 if ret == ffi::AVERROR(ffi::EAGAIN) {
-                    break Ok(true);
+                    return Ok(true);
                 }
                 if ret == ffi::AVERROR_EOF {
-                    break Ok(false);
+                    return Ok(false);
                 }
                 if let Err(e) = check("avcodec_receive_packet", ret) {
-                    break Err(e);
+                    ffi::av_packet_unref(self.pkt);
+                    return Err(e);
                 }
-                let p = &*pkt;
+                let p = &*self.pkt;
                 let data = std::slice::from_raw_parts(p.data, p.size.max(0) as usize);
-                out.push(Packet {
+                out.push(Packet::new(
                     stream,
-                    key: p.flags & ffi::AV_PKT_FLAG_KEY != 0,
-                    pts_us: p.pts,
-                    dts_us: p.dts,
-                    data: Bytes::copy_from_slice(data),
-                });
-                ffi::av_packet_unref(pkt);
-            };
-            ffi::av_packet_free(&mut pkt);
-            result
+                    p.flags & ffi::AV_PKT_FLAG_KEY != 0,
+                    p.pts,
+                    p.dts,
+                    self.slab.copy_from_slice(data),
+                ));
+                ffi::av_packet_unref(self.pkt);
+            }
         }
     }
 }
@@ -466,10 +470,12 @@ impl AudioCodec {
     }
 }
 
-/// One audio track encoder. Owns its context and a reusable input frame.
+/// One audio track encoder. Owns its context and reusable input frame/output packet.
 pub struct AudioEncoder {
     ctx: *mut ffi::AVCodecContext,
     frame: *mut ffi::AVFrame,
+    pkt: *mut ffi::AVPacket,
+    slab: PacketSlab,
     planar: bool,
     /// Samples per channel the encoder wants per frame (AAC 1024, Opus 960).
     pub frame_size: usize,
@@ -487,7 +493,7 @@ impl AudioEncoder {
             AudioCodec::Aac => (c"aac", 160_000, ffi::AVSampleFormat::AV_SAMPLE_FMT_FLTP),
             AudioCodec::Opus => (c"libopus", 128_000, ffi::AVSampleFormat::AV_SAMPLE_FMT_FLT),
         };
-        // SAFETY: standard open sequence; ctx/frame owned by Self from allocation on, so
+        // SAFETY: standard open sequence; ctx/frame/pkt owned by Self from allocation on, so
         // early returns free them in Drop.
         unsafe {
             let c = ffi::avcodec_find_encoder_by_name(name.as_ptr());
@@ -498,13 +504,19 @@ impl AudioEncoder {
             if ctx.is_null() {
                 return Err(EncodeError::Unsupported("avcodec_alloc_context3 returned NULL"));
             }
+            let pkt = ffi::av_packet_alloc();
             let mut enc = AudioEncoder {
                 ctx,
                 frame: ptr::null_mut(),
+                pkt,
+                slab: PacketSlab::new(),
                 planar: fmt == ffi::AVSampleFormat::AV_SAMPLE_FMT_FLTP,
                 frame_size: 0,
                 origin_us,
             };
+            if pkt.is_null() {
+                return Err(EncodeError::Unsupported("av_packet_alloc returned NULL"));
+            }
             (*ctx).sample_fmt = fmt;
             (*ctx).sample_rate = AUDIO_RATE;
             ffi::av_channel_layout_default(&mut (*ctx).ch_layout, 2);
@@ -571,36 +583,31 @@ impl AudioEncoder {
 
     fn drain(&mut self, stream: u8, out: &mut Vec<Packet>) -> Result<bool> {
         let to_us = |samples: i64| self.origin_us + (i128::from(samples) * 1_000_000 / i128::from(AUDIO_RATE)) as i64;
-        // SAFETY: packet allocated and freed here.
+        // SAFETY: self.pkt is a reusable owned packet; data valid until unref.
         unsafe {
-            let mut pkt = ffi::av_packet_alloc();
-            if pkt.is_null() {
-                return Err(EncodeError::Unsupported("av_packet_alloc returned NULL"));
-            }
-            let result = loop {
-                let ret = ffi::avcodec_receive_packet(self.ctx, pkt);
+            loop {
+                let ret = ffi::avcodec_receive_packet(self.ctx, self.pkt);
                 if ret == ffi::AVERROR(ffi::EAGAIN) {
-                    break Ok(true);
+                    return Ok(true);
                 }
                 if ret == ffi::AVERROR_EOF {
-                    break Ok(false);
+                    return Ok(false);
                 }
                 if let Err(e) = check("avcodec_receive_packet", ret) {
-                    break Err(e);
+                    ffi::av_packet_unref(self.pkt);
+                    return Err(e);
                 }
-                let p = &*pkt;
+                let p = &*self.pkt;
                 let data = std::slice::from_raw_parts(p.data, p.size.max(0) as usize);
-                out.push(Packet {
+                out.push(Packet::new(
                     stream,
-                    key: true, // audio packets are all sync points
-                    pts_us: to_us(p.pts),
-                    dts_us: to_us(p.dts),
-                    data: Bytes::copy_from_slice(data),
-                });
-                ffi::av_packet_unref(pkt);
-            };
-            ffi::av_packet_free(&mut pkt);
-            result
+                    true, // audio packets are all sync points
+                    to_us(p.pts),
+                    to_us(p.dts),
+                    self.slab.copy_from_slice(data),
+                ));
+                ffi::av_packet_unref(self.pkt);
+            }
         }
     }
 
@@ -623,8 +630,9 @@ impl AudioEncoder {
 
 impl Drop for AudioEncoder {
     fn drop(&mut self) {
-        // SAFETY: we own both; free functions accept NULL.
+        // SAFETY: we own frame, pkt, and ctx; free functions accept NULL.
         unsafe {
+            ffi::av_packet_free(&mut self.pkt);
             ffi::av_frame_free(&mut self.frame);
             ffi::avcodec_free_context(&mut self.ctx);
         }

@@ -273,7 +273,11 @@ impl MemTrace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Display,
-    Window { hwnd: isize, exe: String, title: String },
+    Window {
+        hwnd: isize,
+        exe: String,
+        title: String,
+    },
     /// The chosen app is not there and there is no fallback: the last frame is held.
     Waiting,
 }
@@ -321,16 +325,18 @@ impl Watch {
         let stop = Arc::new(AtomicBool::new(false));
         if src.kind != config::SourceKind::Display {
             let (l, s) = (latest.clone(), stop.clone());
-            let _ = std::thread::Builder::new().name("suicap-source-watch".into()).spawn(move || {
-                while !s.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(1000));
-                    let cur = l.lock().map(|g| g.clone()).unwrap_or(Target::Display);
-                    let next = resolve(&src, Some(&cur));
-                    if let Ok(mut g) = l.lock() {
-                        *g = next;
+            let _ = std::thread::Builder::new()
+                .name("suicap-source-watch".into())
+                .spawn(move || {
+                    while !s.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1000));
+                        let cur = l.lock().map(|g| g.clone()).unwrap_or(Target::Display);
+                        let next = resolve(&src, Some(&cur));
+                        if let Ok(mut g) = l.lock() {
+                            *g = next;
+                        }
                     }
-                }
-            });
+                });
         }
         Self { latest, stop }
     }
@@ -632,9 +638,9 @@ impl VideoPath {
                     self.reopening = None;
                     self.bad_window = Some(hwnd);
                     if let Target::Window { exe, .. } = &self.active {
-                        self.stats
-                            .notes
-                            .push(format!("Could not record {exe} ({why}); recording the display instead."));
+                        self.stats.notes.push(format!(
+                            "Could not record {exe} ({why}); recording the display instead."
+                        ));
                     }
                     self.active = Target::Display;
                     self.start_reopen(None);
@@ -675,7 +681,11 @@ impl VideoPath {
         if let Target::Window { hwnd, .. } = &want
             && self.bad_window == Some(*hwnd)
         {
-            want = if self.source_cfg.fallback { Target::Display } else { Target::Waiting };
+            want = if self.source_cfg.fallback {
+                Target::Display
+            } else {
+                Target::Waiting
+            };
         }
         if want == self.active {
             return;
@@ -996,6 +1006,7 @@ pub enum SessionEvent {
     RecordingStarted,
     RecordingSaved(ClipInfo),
     RecordingFailed(String),
+    ScreenshotTaken(PathBuf),
     ScreenshotSaved(PathBuf),
     ScreenshotFailed(String),
     /// The video path failed and is being rebuilt (plan §7); the buffer was cleared.
@@ -1354,10 +1365,13 @@ fn run_session(
                         .map_err(|e| format!("clips folder: {e}"))
                         .and_then(|path| Ok((path, v.screenshot()?)));
                     match started {
-                        // PNG encoding runs off the video thread.
-                        Ok((path, image)) => shots.push(std::thread::spawn(move || {
-                            shot::write_png(&image, &path).map_err(|e| e.to_string())
-                        })),
+                        // PNG encoding runs off the video thread; notify immediately on capture.
+                        Ok((path, image)) => {
+                            on_event(SessionEvent::ScreenshotTaken(path.clone()));
+                            shots.push(std::thread::spawn(move || {
+                                shot::write_png(&image, &path).map_err(|e| e.to_string())
+                            }));
+                        }
                         Err(e) => on_event(SessionEvent::ScreenshotFailed(e)),
                     }
                 }
