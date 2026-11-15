@@ -104,6 +104,17 @@
         scroll-behavior: smooth;
       }
 
+      /* No text highlighting anywhere on the page. */
+      *,
+      *::before,
+      *::after {
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      ::selection {
+        background: transparent;
+      }
+
       body {
         margin: 0;
         font-family: var(--font);
