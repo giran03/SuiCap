@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.1.2 (in development)
+
 ## 0.1.1 (2026-11-15)
 
 ### Added
