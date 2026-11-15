@@ -8,7 +8,10 @@
 //! exactly as wide as the text, however the size and options are set. A new window stays
 //! hidden until that first measurement arrives.
 
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use suicap_core::config::BadgeCorner;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -31,12 +34,17 @@ static REQUESTED: Mutex<Want> = Mutex::new(None);
 static REALIZED: Mutex<Want> = Mutex::new(None);
 /// Logical size the page last reported; `None` until the current window has measured itself.
 static SIZE: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// Once shutdown starts, no new badge window may be created or shown.
+static CLOSING: AtomicBool = AtomicBool::new(false);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn wanted(app: &AppHandle) -> Want {
+    if CLOSING.load(Ordering::Acquire) {
+        return None;
+    }
     let state = app.state::<AppState>();
     let s = state.settings();
     let st = state.status();
@@ -53,6 +61,9 @@ pub fn announces_clips(app: &AppHandle) -> bool {
 /// Show, move or hide the badge to match the settings and recording state. Cheap when
 /// nothing changed (it runs on every status tick); the window work happens on its own thread.
 pub fn sync(app: &AppHandle) {
+    if CLOSING.load(Ordering::Acquire) {
+        return;
+    }
     let want = wanted(app);
     {
         let mut requested = lock(&REQUESTED);
@@ -81,8 +92,26 @@ pub fn sync(app: &AppHandle) {
     });
 }
 
+/// Immediately hide and destroy the badge overlay during app shutdown so it cannot linger
+/// or be re-created by in-flight sync/resize threads.
+pub fn close_now(app: &AppHandle) {
+    CLOSING.store(true, Ordering::Release);
+    *lock(&REQUESTED) = None;
+    *lock(&REALIZED) = None;
+    *lock(&SIZE) = None;
+    // Every window goes with the app (settings, tray menu, badge), so none lingers while
+    // capture winds down during exit.
+    for (_, w) in app.webview_windows() {
+        let _ = w.hide();
+        let _ = w.destroy();
+    }
+}
+
 /// The page reported its content size: size the window to it, put it in its corner, show it.
 pub fn resized(app: &AppHandle, width: f64, height: f64) {
+    if CLOSING.load(Ordering::Acquire) {
+        return;
+    }
     let size = (width.clamp(24.0, 800.0), height.clamp(12.0, 300.0));
     *lock(&SIZE) = Some(size);
     let app = app.clone();

@@ -10,6 +10,7 @@ pub mod config;
 pub mod encode;
 pub mod error;
 pub mod fault;
+pub mod game;
 pub mod mux;
 pub mod pipeline;
 pub mod preprocess;

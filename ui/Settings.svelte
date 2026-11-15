@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { slide, scale, fade } from "svelte/transition";
+  import { slide, scale, fade, fly } from "svelte/transition";
   import { cubicOut, backOut } from "svelte/easing";
   import { api, errorText, onStatus, onUpdate, onBadgeIcon, type AppInfo, type BadgeCorner, type CodecSupport, type Display, type PresetName, type Settings, type Status, type UpdateInfo } from "./api";
   import HotkeyInput from "./HotkeyInput.svelte";
@@ -31,6 +31,7 @@
   let displays = $state<Display[]>([]);
   let defaultDir = $state("");
   let estimate = $state(0);
+  const fmtSize = (mb: number) => (mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`);
   let saveError = $state("");
   let actionError = $state("");
   let settingsOpen = $state(false);
@@ -441,7 +442,7 @@
     if (src.kind === "auto") {
       return target?.kind === "window" && target.exe
         ? `Following ${friendlyName(target.exe)}`
-        : "No full-screen game right now: recording the display";
+        : "No game right now: recording the display";
     }
     if (src.kind === "display") return "Recording the display";
     if (!src.exe) return "Choose an application to record";
@@ -570,15 +571,6 @@
       {#if status?.settings_warning}
         <p class="banner warn" transition:slide={{ duration: 260, easing: cubicOut }}>{status.settings_warning}</p>
       {/if}
-      {#if pending}
-        <div class="banner confirm" role="alert" transition:slide={{ duration: 260, easing: cubicOut }}>
-          <span>These changes restart capture and clear the {Math.round(status?.buffered_secs ?? 0)} s in the replay buffer.</span>
-          <span class="inline">
-            <button class="btn ghost" onclick={undo}>Undo</button>
-            <button class="btn primary" onclick={persist}>Apply</button>
-          </span>
-        </div>
-      {/if}
       {#each status?.notes ?? [] as note (note)}
         <p class="banner info" transition:slide={{ duration: 260, easing: cubicOut }}>{note}</p>
       {/each}
@@ -619,6 +611,7 @@
               <div class="tiles">
                 <div class="tile-stat"><span>Buffered</span><b>{Math.min(status.buffered_secs, status.buffer_secs).toFixed(0)} s</b><small>of {status.buffer_secs} s</small></div>
                 <div class="tile-stat"><span>Memory</span><b>{status.buffered_mb.toFixed(0)} MB</b><small>in the buffer</small></div>
+                <div class="tile-stat" title="The most a clip of the whole buffer can weigh at the highest bitrate of your quality preset, video only. Real clips are usually smaller."><span>Clip size</span><b>{fmtSize(status.buffer_estimate_mb || estimate)}</b><small>est. for {status.buffer_secs} s</small></div>
                 <div class="tile-stat" class:bad={status.dropped > 0}><span>Dropped</span><b>{status.dropped}</b><small>frames</small></div>
               </div>
             {:else}
@@ -790,7 +783,7 @@
                 </div>
               </div>
             {:else if src.kind === "auto"}
-              <p class="src-note" transition:slide={{ duration: 200 }}>Follows the full-screen game automatically, the display otherwise.</p>
+              <p class="src-note" transition:slide={{ duration: 200 }}>Follows the game you play automatically (exclusive, borderless or windowed fullscreen, or a known game in a window), the display otherwise.</p>
             {/if}
             {#if src.kind !== "display"}
               <div class="src-row" transition:slide={{ duration: 200 }}>
@@ -889,6 +882,18 @@
   </main>
   </div>
 </div>
+
+{#if pending}
+  <div class="apply-toast-wrap" transition:fly={{ y: 18, duration: 220, easing: cubicOut }}>
+    <div class="banner confirm apply-toast" role="alert">
+      <span>These changes restart capture and clear the {Math.round(status?.buffered_secs ?? 0)} s in the replay buffer.</span>
+      <span class="inline">
+        <button class="btn ghost" onclick={undo}>Undo</button>
+        <button class="btn primary" onclick={persist}>Apply</button>
+      </span>
+    </div>
+  </div>
+{/if}
 
 {#if settingsOpen}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
@@ -1239,7 +1244,7 @@
   /* Stat tiles (Site Builder "stat tiles"). */
   .tiles {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 8px;
     margin-top: 14px;
   }
@@ -1935,6 +1940,27 @@
     gap: 12px;
     background: var(--accent-soft);
     box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .apply-toast-wrap {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 20px;
+    z-index: 60;
+    display: flex;
+    justify-content: center;
+    padding: 0 20px;
+    pointer-events: none;
+  }
+  .banner.confirm.apply-toast {
+    pointer-events: auto;
+    margin: 0;
+    max-width: min(680px, 100%);
+    background: color-mix(in srgb, var(--accent-soft) 92%, var(--surface));
+    backdrop-filter: blur(14px);
+    box-shadow:
+      inset 0 0 0 1px var(--accent),
+      0 12px 32px rgba(0, 0, 0, 0.36);
   }
   .banner.info {
     background: var(--surface);

@@ -398,6 +398,49 @@ pub struct Frame {
     wgc: Option<Direct3D11CaptureFrame>,
 }
 
+impl Frame {
+    /// A small black frame (letterboxed to all black), shown until the source delivers one:
+    /// a monitor taken over by an exclusive full-screen game may send nothing for a while.
+    pub fn black(device: &ID3D11Device) -> Result<Self> {
+        use windows::Win32::Graphics::{
+            Direct3D11::{
+                D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_DEFAULT,
+            },
+            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+        };
+        const SIDE: u32 = 64;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: SIDE,
+            Height: SIDE,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            ..Default::default()
+        };
+        let pixels = vec![0u8; (SIDE * SIDE * 4) as usize];
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: SIDE * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut tex = None;
+        // SAFETY: `pixels` outlives the call; out-param is a local.
+        unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut tex))? };
+        let tex = tex.ok_or_else(|| CaptureError::Unavailable("CreateTexture2D returned no texture".into()))?;
+        Ok(Self {
+            tex,
+            qpc_us: qpc_now_us(),
+            width: SIDE,
+            height: SIDE,
+            wgc: None,
+        })
+    }
+}
+
 impl Drop for Frame {
     fn drop(&mut self) {
         if let Some(f) = self.wgc.take() {

@@ -25,7 +25,7 @@
       title: "Game",
       color: "#ff9f0a",
       icon: "M6 11h4M8 9v4M15 12h.01M18 10h.01M17.3 5H6.7a4 4 0 0 0-3.9 3.1l-1.2 5.4A3 3 0 0 0 4.5 17a3 3 0 0 0 2.4-1.2L8 14h8l1.1 1.8A3 3 0 0 0 19.5 17a3 3 0 0 0 2.9-3.5l-1.2-5.4A4 4 0 0 0 17.3 5z",
-      desc: "The game itself. Left empty, it records the full-screen app in front when replay starts.",
+      desc: "The game itself. Left empty, it follows the game you play: full screen in any mode, or a known game in a window.",
     },
     {
       id: "voice",
@@ -64,11 +64,6 @@
   const mutedTracks = $derived(appTracks.filter((t) => !s.audio.tracks[t.id]).map((t) => t.title));
 
   // When the Game list is empty, show the currently captured window/fullscreen process.
-  const autoGame = $derived(
-    s.audio.game.length === 0 && status?.capture_target.kind === "window" && status.capture_target.exe
-      ? status.capture_target.exe
-      : null,
-  );
 
   // ---- Microphones ----
   // The list follows the system: it reloads when the page opens, on a timer, when the window
@@ -105,7 +100,9 @@
     loading = true;
     try {
       running = await api.audioApps();
+      checked = true;
       rememberNames(running);
+      detected = await api.foregroundGame().catch(() => null);
     } catch {
       running = [];
     }
@@ -124,27 +121,24 @@
 
   const lower = (x: string) => x.toLowerCase();
 
-  // ---- Which listed apps exist on this machine ----
-  // Defaults name programs most people do not have (TeamSpeak, Opera...). Those stay in the
-  // settings but are hidden here; `null` = not checked yet. Apps added or moved this session
+  // ---- Which listed apps show ----
+  // A listed app only shows while it has an audio session ("Playing now"). The rest stay in the
+  // settings, hidden, and come back when they make sound. Apps added or moved this session
   // always show, and "hidden" can be revealed.
-  let present = $state<Set<string> | null>(null);
+  let checked = $state(false);
   const pinned = new Set<string>();
   let reveal = $state<Record<ListKey, boolean>>({ game: false, voice: false, media: false, ignored: false });
-  const listed = $derived(LISTS.flatMap((k) => s.audio[k]).map(lower).sort().join("|"));
-  $effect(() => {
-    const all = listed ? listed.split("|") : [];
-    let live = true;
-    api
-      .presentApps(all)
-      .then((p) => live && (present = new Set(p)))
-      .catch(() => live && (present = new Set(all)));
-    return () => (live = false);
-  });
   const shown = (k: ListKey, x: string) =>
-    reveal[k] || pinned.has(lower(x)) || (present?.has(lower(x)) ?? false);
+    reveal[k] || pinned.has(lower(x)) || running.some((a) => lower(a.exe) === lower(x));
   const visible = (k: ListKey) => s.audio[k].filter((x) => shown(k, x));
-  const hiddenCount = (k: ListKey) => (present ? s.audio[k].filter((x) => !shown(k, x)).length : 0);
+  const hiddenCount = (k: ListKey) => (checked ? s.audio[k].filter((x) => !shown(k, x)).length : 0);
+  // The detected game (full screen in any mode, or a known game in a window), polled below.
+  let detected = $state<string | null>(null);
+  const autoGame = $derived(
+    visible("game").length === 0
+      ? ((s.audio.game.length === 0 && status?.capture_target.kind === "window" && status.capture_target.exe) || detected || null)
+      : null,
+  );
   function where(exe: string): ListKey | null {
     return LISTS.find((k) => s.audio[k].some((x) => lower(x) === lower(exe))) ?? null;
   }
@@ -166,8 +160,12 @@
     notice = "";
     if (target) pinned.add(lower(exe));
     edit((d) => {
+      const was = LISTS.some((k) => d.audio[k].some((x) => lower(x) === lower(exe)));
       for (const k of LISTS) d.audio[k] = d.audio[k].filter((x) => lower(x) !== lower(exe));
+      d.audio.dismissed = d.audio.dismissed.filter((x) => lower(x) !== lower(exe));
       if (target) d.audio[target].push(exe);
+      // Removed on purpose: do not add it again just because it plays.
+      else if (was && d.audio.dismissed.length < 128) d.audio.dismissed.push(exe);
     });
   }
 
@@ -280,7 +278,7 @@
     items.push({ label: "Add app by name…", run: () => startAdd(k) });
     if (hidden > 0 || reveal[k]) {
       items.push({
-        label: reveal[k] ? "Hide apps that are not installed" : `Show ${hidden} app${hidden === 1 ? "" : "s"} not installed`,
+        label: reveal[k] ? "Hide apps that are not playing" : `Show ${hidden} hidden app${hidden === 1 ? "" : "s"}`,
         run: () => (reveal[k] = !reveal[k]),
       });
     }
@@ -339,6 +337,8 @@
       d.audio.mic = true;
       d.audio.tracks = { mix: true, game: true, voice: true, media: true };
       d.audio.ignored = [];
+      d.audio.dismissed = [];
+      d.audio.auto_add = true;
       d.audio.game = [];
       d.audio.voice = [...DEFAULTS.voice];
       d.audio.media = [...DEFAULTS.media];
@@ -394,7 +394,7 @@
           <span class="chip-name">{friendlyName(autoGame)}</span>
           <span class="chip-tag">Auto</span>
         </span>
-      {:else if present}
+      {:else if checked}
         <span class="empty" transition:fade={{ duration: 120 }}>{hint}</span>
       {/if}
     {/each}
@@ -416,7 +416,7 @@
   </div>
   {#if hiddenCount(k) > 0 || reveal[k]}
     <button class="hidden-note" transition:slide={{ duration: 180 }} onclick={() => (reveal[k] = !reveal[k])}>
-      {#if reveal[k]}Hide apps that are not installed{:else}{hiddenCount(k)} not installed · show{/if}
+      {#if reveal[k]}Hide apps that are not playing{:else}{hiddenCount(k)} hidden · show{/if}
     </button>
   {/if}
   {#if addTo === k && addError}<p class="err" transition:slide={{ duration: 160 }}>{addError}</p>{/if}
@@ -429,6 +429,13 @@
       <div class="m-desc">Each track below is saved separately in the clip, so you can mix them later in your editor.</div>
     </div>
     <Toggle on={s.audio.enabled} label="Record audio" onchange={(v) => edit((d) => (d.audio.enabled = v))} />
+  </div>
+  <div class="m-row">
+    <div class="m-text">
+      <div class="m-title">Add apps automatically</div>
+      <div class="m-desc">An app that plays sound and is on no list is parked under Not recorded by itself, so nothing is captured you did not choose. Drag it to a track to record it.</div>
+    </div>
+    <Toggle on={s.audio.auto_add} label="Add apps automatically" onchange={(v) => edit((d) => (d.audio.auto_add = v))} />
   </div>
 </section>
 
@@ -506,7 +513,7 @@
           <Toggle {on} label="{t.title} track" onchange={(v) => setTrack(t.id, v)} />
         </header>
         <p class="t-desc">{t.desc}</p>
-        {@render dropzone(t.id, t.id === "game" ? "Automatic: the full-screen app" : "Drop apps here")}
+        {@render dropzone(t.id, t.id === "game" ? "Automatic: the game you play" : "Drop apps here")}
         {#if !on}
           <p class="t-note" transition:slide={{ duration: 200 }}>Muted. These apps are silent in the clip, including the Mix.</p>
         {/if}

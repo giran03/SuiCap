@@ -424,7 +424,7 @@ pub fn toggle_target_app(app: &AppHandle) {
     let msg = if s.source.kind == SourceKind::App {
         s.source.kind = SourceKind::Display;
         "Recording the whole display".to_owned()
-    } else if let Some(w) = suicap_core::targets::foreground_window(false) {
+    } else if let Some(w) = suicap_core::targets::foreground_window() {
         s.source.kind = SourceKind::App;
         s.source.exe = w.exe.clone();
         s.source.title = String::new();
@@ -642,5 +642,6 @@ pub async fn codec_support(
 
 #[tauri::command]
 pub fn quit(app: AppHandle) {
+    crate::tray::shutdown(&app);
     app.exit(0);
 }

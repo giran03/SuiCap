@@ -4,10 +4,7 @@
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, RECT},
-        Graphics::{
-            Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
-            Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
-        },
+        Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
         System::Threading::GetCurrentProcessId,
         UI::WindowsAndMessaging::{
             EnumWindows, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect,
@@ -86,7 +83,7 @@ fn class_of(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-fn info_of(hwnd: HWND, exe_of: &dyn Fn(u32) -> Option<String>) -> Option<WindowInfo> {
+pub(crate) fn info_of(hwnd: HWND, exe_of: &dyn Fn(u32) -> Option<String>) -> Option<WindowInfo> {
     // SAFETY: plain Win32 queries with locals as out-params.
     unsafe {
         let mut pid = 0u32;
@@ -180,33 +177,16 @@ pub fn find_window(exe: &str, title: &str) -> Option<WindowInfo> {
     pick_window(&list_windows(), exe, title).cloned()
 }
 
-/// The window in front, if it is an ordinary app window (not the desktop or shell).
-/// `fullscreen_only` additionally requires it to cover its whole monitor.
-pub fn foreground_window(fullscreen_only: bool) -> Option<WindowInfo> {
-    // SAFETY: plain Win32 queries with locals as out-params.
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_invalid() {
-            return None;
-        }
-        if fullscreen_only {
-            let mut rect = RECT::default();
-            GetWindowRect(hwnd, &mut rect).ok()?;
-            let mut mi = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
-                return None;
-            }
-            let m = mi.rcMonitor;
-            if !(rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom) {
-                return None;
-            }
-        }
-        let info = info_of(hwnd, &crate::audio::pid_exe)?;
-        (!is_shell(&info.exe) && info.width >= 100 && info.height >= 60).then_some(info)
+/// The window in front, if it is an ordinary app window (not the desktop or shell). For the
+/// game (full screen, exclusive, or a known game in a window) use [`crate::game::detect`].
+pub fn foreground_window() -> Option<WindowInfo> {
+    // SAFETY: plain Win32 query.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return None;
     }
+    let info = info_of(hwnd, &crate::audio::pid_exe)?;
+    (!is_shell(&info.exe) && info.width >= 100 && info.height >= 60).then_some(info)
 }
 
 #[cfg(test)]

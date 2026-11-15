@@ -16,6 +16,7 @@ use crate::{
     buffer::{Packet, ReplayBuffer, VIDEO_STREAM},
     capture::{self, Adapter, CaptureError, CaptureSource, Output, Pacer, WgcSource},
     config::{self, Codec, VideoPreset},
+    game,
     encode::{
         self, Encoder, EncoderSettings, HwDevice, HwFrame, HwFrames, MAX_FRAMES_IN_FLIGHT, Sent, StreamParams, SwFormat,
     },
@@ -284,7 +285,8 @@ pub enum Target {
 
 /// What the source setting means right now. `current` keeps an automatic pick on its game
 /// while that window is still there, so glancing at another window does not flip the source.
-fn resolve(src: &config::SourceSettings, current: Option<&Target>) -> Target {
+/// `game` is the detected game ([`game::detect`]); only the automatic source uses it.
+fn resolve(src: &config::SourceSettings, current: Option<&Target>, game: Option<game::Game>) -> Target {
     use config::SourceKind;
     let window = |w: targets::WindowInfo| Target::Window {
         hwnd: w.hwnd,
@@ -304,45 +306,59 @@ fn resolve(src: &config::SourceSettings, current: Option<&Target>) -> Target {
             {
                 return window(w);
             }
-            match targets::foreground_window(true) {
-                Some(w) => window(w),
+            match game {
+                Some(g) => window(g.window),
                 None => Target::Display,
             }
         }
     }
 }
 
-/// Re-resolves the source setting once a second on its own thread (listing windows is too slow
-/// for a video tick); the video thread just reads the latest answer.
+/// Re-resolves the source setting and looks for the game once a second on its own thread
+/// (listing windows is too slow for a video tick); the video thread just reads the answers.
 struct Watch {
     latest: Arc<Mutex<Target>>,
+    /// A game fills a monitor (exclusive, borderless or windowed fullscreen).
+    game_fullscreen: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
 
 impl Watch {
-    fn start(src: config::SourceSettings, initial: Target) -> Self {
+    fn start(src: config::SourceSettings, initial: Target, game_fullscreen: bool) -> Self {
         let latest = Arc::new(Mutex::new(initial));
+        let full = Arc::new(AtomicBool::new(game_fullscreen));
         let stop = Arc::new(AtomicBool::new(false));
-        if src.kind != config::SourceKind::Display {
-            let (l, s) = (latest.clone(), stop.clone());
-            let _ = std::thread::Builder::new()
-                .name("suicap-source-watch".into())
-                .spawn(move || {
-                    while !s.load(Ordering::Acquire) {
-                        std::thread::sleep(Duration::from_millis(1000));
-                        let cur = l.lock().map(|g| g.clone()).unwrap_or(Target::Display);
-                        let next = resolve(&src, Some(&cur));
-                        if let Ok(mut g) = l.lock() {
-                            *g = next;
-                        }
+        let (l, f, s) = (latest.clone(), full.clone(), stop.clone());
+        let _ = std::thread::Builder::new()
+            .name("suicap-source-watch".into())
+            .spawn(move || {
+                while !s.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1000));
+                    let found = game::detect();
+                    f.store(found.as_ref().is_some_and(|g| g.mode.is_fullscreen()), Ordering::Release);
+                    if src.kind == config::SourceKind::Display {
+                        continue;
                     }
-                });
+                    let cur = l.lock().map(|g| g.clone()).unwrap_or(Target::Display);
+                    let next = resolve(&src, Some(&cur), found);
+                    if let Ok(mut g) = l.lock() {
+                        *g = next;
+                    }
+                }
+            });
+        Self {
+            latest,
+            game_fullscreen: full,
+            stop,
         }
-        Self { latest, stop }
     }
 
     fn latest(&self) -> Target {
         self.latest.lock().map(|g| g.clone()).unwrap_or(Target::Display)
+    }
+
+    fn game_fullscreen(&self) -> bool {
+        self.game_fullscreen.load(Ordering::Acquire)
     }
 }
 
@@ -429,6 +445,11 @@ pub struct VideoPath {
     source_cfg: config::SourceSettings,
     active: Target,
     watch: Watch,
+    /// Stall watchdog: when the source last delivered a frame, when it may next be recreated
+    /// for silence, and how many times in a row it was (the wait doubles each time).
+    last_fresh_us: i64,
+    stall_next_us: i64,
+    stall_tries: u32,
     /// A window Windows refused to capture; not retried while it stays the same window.
     bad_window: Option<isize>,
     /// The stats' source text while the display is recorded.
@@ -451,7 +472,9 @@ impl VideoPath {
         encode::set_log_quiet(false); // warnings and errors only
         let trace = MemTrace::from_env();
         trace.mark("start");
-        let first_target = resolve(&opts.source, None);
+        let found = game::detect();
+        let game_fullscreen = found.as_ref().is_some_and(|g| g.mode.is_fullscreen());
+        let first_target = resolve(&opts.source, None, found);
         let (adapter, output, fell_back) = match &first_target {
             Target::Window { hwnd, .. } => pick_output_for_window(*hwnd, opts.display)?,
             _ => pick_output_or_primary(opts.display)?,
@@ -506,7 +529,13 @@ impl VideoPath {
             ));
         }
         trace.mark("WGC session");
-        let first = wait_first_frame(&mut src, Duration::from_secs(2))?;
+        let first = match wait_first_frame(&mut src, Duration::from_secs(2)) {
+            Ok(f) => f,
+            // An exclusive full-screen game can hold the monitor's frames back: start on black
+            // instead of failing to arm; the stall watchdog recreates the source.
+            Err(PipelineError::NoFirstFrame(_)) => capture::Frame::black(&device)?,
+            Err(e) => return Err(e),
+        };
         let last = Some(convert(&mut pre, &frames, &first)?);
         drop(first);
         trace.mark("first frame converted");
@@ -536,7 +565,10 @@ impl VideoPath {
             luid: adapter.luid,
             display: opts.display,
             cursor: opts.cursor,
-            watch: Watch::start(opts.source.clone(), active.clone()),
+            watch: Watch::start(opts.source.clone(), active.clone(), game_fullscreen),
+            last_fresh_us: capture::qpc_now_us(),
+            stall_next_us: 0,
+            stall_tries: 0,
             source_cfg: opts.source.clone(),
             active,
             bad_window,
@@ -589,6 +621,8 @@ impl VideoPath {
             if let Some(f) = self.poll_source()? {
                 self.last = Some(convert(&mut self.pre, &self.frames, &f)?);
                 self.stats.fresh += 1;
+                self.last_fresh_us = tick.pts_us;
+                self.stall_tries = 0;
             }
             let frame = self.last.as_ref().expect("first frame converted in open");
             match self.encoder.send(Some(frame), tick.pts_us)? {
@@ -658,6 +692,11 @@ impl VideoPath {
         if self.active == Target::Waiting {
             return Ok(None); // holding the last frame until the app is back
         }
+        if self.src.is_some() && self.stalled() {
+            let old = self.src.take();
+            self.start_reopen(old);
+            return Ok(None);
+        }
         let Some(src) = self.src.as_mut() else {
             if capture::qpc_now_us() >= self.retry_at_us {
                 self.start_reopen(None);
@@ -672,6 +711,21 @@ impl VideoPath {
             }
             other => Ok(other?),
         }
+    }
+
+    /// The source has sent nothing for a while although a game fills a monitor: a switch into
+    /// or out of exclusive fullscreen (or a display mode change) can leave a capture session
+    /// silent without closing it. Recreating it then is cheap and runs off the video thread; a
+    /// still screen merely gets recreated less and less often (2 s, 4 s, ... up to 32 s).
+    fn stalled(&mut self) -> bool {
+        const STALL_US: i64 = 2_000_000;
+        let now = capture::qpc_now_us();
+        if now - self.last_fresh_us < STALL_US || now < self.stall_next_us || !self.watch.game_fullscreen() {
+            return false;
+        }
+        self.stall_tries += 1;
+        self.stall_next_us = now + (STALL_US << self.stall_tries.min(4));
+        true
     }
 
     /// Move the source when what the setting means has changed: the app started or closed,

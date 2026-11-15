@@ -207,6 +207,21 @@ fn tooltip(st: &Status) -> String {
     }
 }
 
+/// Take everything down at once: windows, badge and the tray icon go first (so nothing lingers
+/// on screen while capture winds down), and a watchdog ends the process if the orderly exit
+/// stalls, so no SuiCap process is left behind. Safe to call more than once.
+pub fn shutdown(app: &AppHandle) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    crate::badge::close_now(app);
+    let _ = app.remove_tray_by_id(TRAY_ID);
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            std::process::exit(0);
+        });
+    });
+}
+
 pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon_image(Phase::Idle))
@@ -1263,7 +1278,10 @@ fn execute_action(app: &AppHandle, action: MenuAction) {
             }
         }
         MenuAction::OpenSettings => open_settings(app),
-        MenuAction::Quit => app.exit(0),
+        MenuAction::Quit => {
+            shutdown(app);
+            app.exit(0);
+        }
     }
 }
 

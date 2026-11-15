@@ -21,8 +21,7 @@ use std::{
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_OBJECT_0},
-        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         Media::Audio::{
             AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -43,12 +42,11 @@ use windows::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
             },
             Threading::{
-                AvSetMmThreadCharacteristicsW, CreateEventW, GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32,
+                AvSetMmThreadCharacteristicsW, CreateEventW, OpenProcess, PROCESS_NAME_WIN32,
                 PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, WaitForSingleObject,
             },
             Variant::VT_BLOB,
         },
-        UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId},
     },
     core::{HRESULT, IUnknown, Interface, PCWSTR, PWSTR, Ref, implement, w},
 };
@@ -163,6 +161,9 @@ impl Timeline {
         l.cursor = Some(pos + frames);
         let skip = (emit_pos - pos).clamp(0, frames);
         l.late_samples += skip as u64;
+        if skip == frames {
+            return; // wholly before `emit_pos` (a delayed source): nothing left to place
+        }
         let off = ((pos + skip - emit_pos) * 2) as usize;
         if samples.is_empty() {
             // Trailing silence needs no storage because `pop_into` and future writes pad with 0.0;
@@ -405,9 +406,12 @@ pub struct AudioOptions {
     pub game: Vec<Target>,
     pub voice: Vec<Target>,
     pub media: Vec<Target>,
-    /// The full-screen app an empty Game list stood for when capture started. Kept for the whole
-    /// session, so re-routing while the settings window is in front does not lose the game.
+    /// The game an empty Game list stands for (detected, or the chosen video app). The mixer
+    /// keeps it while nothing else is detected, so the settings window in front does not lose it.
     foreground: Option<(u32, String)>,
+    /// An empty Game list with no chosen app: keep detecting the game while capture runs, so a
+    /// game started (or first found) after capture began still lands on the Game track.
+    follow_game: bool,
 }
 
 impl AudioOptions {
@@ -433,7 +437,7 @@ impl AudioOptions {
                         .find(|p| p.exe.eq_ignore_ascii_case(exe))
                         .map_or((0, exe.to_owned()), |p| (p.pid, p.exe)),
                 ),
-                None => foreground_fullscreen_pid().and_then(|pid| pid_exe(pid).map(|exe| (pid, exe))),
+                None => detected_game(s),
             })
             .flatten();
         let routes = route(s, foreground.clone());
@@ -455,6 +459,7 @@ impl AudioOptions {
             voice: routes.voice,
             media: routes.media,
             foreground,
+            follow_game: s.tracks.game && s.game.is_empty() && app.is_none(),
         }
     }
 }
@@ -537,6 +542,17 @@ fn live_targets(
 
 /// Fast single-PID executable file name lookup via `OpenProcess` + `QueryFullProcessImageNameW`.
 pub fn pid_exe(pid: u32) -> Option<String> {
+    exe_name(&pid_path(pid)?)
+}
+
+/// File name of an executable path (`C:\Games\x.exe` -> `x.exe`).
+pub fn exe_name(path: &str) -> Option<String> {
+    let name = std::path::Path::new(path).file_name()?.to_string_lossy().into_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Full executable path of a process (works for most elevated and protected processes too).
+pub fn pid_path(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
@@ -547,21 +563,16 @@ pub fn pid_exe(pid: u32) -> Option<String> {
         let mut len = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
         let _ = CloseHandle(h);
-        if !ok || len == 0 {
-            return None;
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        let name = std::path::Path::new(&path).file_name()?.to_string_lossy().into_owned();
-        (!name.is_empty()).then_some(name)
+        (ok && len > 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
     }
 }
 
-/// Executable name without `.exe` of the foreground fullscreen app, for clip folders
-/// (plan §6.2); `None` on the desktop.
+/// Executable name without `.exe` of the game being played (see [`crate::game::detect`]), for
+/// clip folders (plan §6.2); `None` on the desktop.
 pub fn foreground_app_name() -> Option<String> {
     let exe = match crate::targets::active_app() {
         Some(exe) => exe, // recording one application: its name, full screen or not
-        None => pid_exe(foreground_fullscreen_pid()?)?,
+        None => crate::game::detect()?.window.exe,
     };
     let stem = exe
         .strip_suffix(".exe")
@@ -570,17 +581,19 @@ pub fn foreground_app_name() -> Option<String> {
     (!stem.is_empty()).then(|| stem.to_owned())
 }
 
-/// Exe name (with `.exe`) of the full-screen app in front, for the status bar. The desktop
-/// shell covers the screen too, so it is not a game.
+/// Exe name (with `.exe`) of the game being played, for the status bar: full screen in any
+/// mode, or a known game in a window. Never the shell or SuiCap itself.
 pub fn foreground_game_exe() -> Option<String> {
-    let exe = pid_exe(foreground_fullscreen_pid()?)?;
-    const SHELL: [&str; 4] = [
-        "explorer.exe",
-        "searchhost.exe",
-        "shellexperiencehost.exe",
-        "applicationframehost.exe",
-    ];
-    (!exe.is_empty() && !SHELL.iter().any(|s| exe.eq_ignore_ascii_case(s))).then_some(exe)
+    crate::game::detect().map(|g| g.window.exe)
+}
+
+/// The game an empty Game list stands for: the detected one, unless the user already gave
+/// that program a track of its own (a browser playing a full-screen video is Media, not a game).
+fn detected_game(s: &crate::config::AudioSettings) -> Option<(u32, String)> {
+    let g = crate::game::detect()?;
+    let exe = g.window.exe;
+    let listed = s.voice.iter().chain(&s.media).chain(&s.ignored).any(|n| n.eq_ignore_ascii_case(&exe));
+    (!listed).then_some((g.window.pid, exe))
 }
 
 #[derive(Debug, Clone)]
@@ -676,31 +689,6 @@ fn resolve(targets: &[Target], procs: &[Proc]) -> Vec<u32> {
     pids.sort_unstable();
     pids.dedup();
     pids
-}
-
-/// Foreground window's process if it covers its whole monitor (plan §5 Game default).
-pub fn foreground_fullscreen_pid() -> Option<u32> {
-    // SAFETY: plain Win32 queries with locals as out-params.
-    unsafe {
-        let hwnd: HWND = GetForegroundWindow();
-        if hwnd.is_invalid() {
-            return None;
-        }
-        let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect).ok()?;
-        let mut mi = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
-            return None;
-        }
-        let m = mi.rcMonitor;
-        let full = rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom;
-        let mut pid = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        (full && pid != 0 && pid != GetCurrentProcessId()).then_some(pid)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1016,7 @@ struct Mixer {
     targets: Vec<(usize, Vec<Target>)>,
     /// Sticky foreground app (see `AudioOptions::foreground`) and the routing revision applied.
     foreground: Option<(u32, String)>,
+    follow_game: bool,
     routes_rev: u64,
     chunk_tx: Sender<Chunk>,
     lines_buf: Vec<Vec<f32>>,
@@ -1113,6 +1102,7 @@ impl AudioPath {
             endpoints: Vec::new(),
             targets: Vec::new(),
             foreground: opts.foreground.clone(),
+            follow_game: opts.follow_game,
             routes_rev: opts.live.routes_rev(),
             chunk_tx,
             lines_buf: Vec::new(),
@@ -1222,6 +1212,9 @@ impl Mixer {
     /// follow the default mic/speakers (device removed or default changed), and
     /// recycle the lines of sources that ended. Their tracks continue with silence.
     fn rescan(&mut self) {
+        if self.follow_game {
+            self.follow_detected_game();
+        }
         let (done, live): (Vec<_>, Vec<_>) = self.sources.drain(..).partition(|s| s.thread.is_finished());
         self.sources = live;
         for s in done {
@@ -1284,6 +1277,19 @@ impl Mixer {
             }
         }
         self.stats.lines = self.timeline.lines();
+    }
+
+    /// An empty Game list follows the game while capture runs: one started (or first found)
+    /// later joins the Game track, a different one takes its place, and the last one found stays
+    /// while nothing is detected (alt-tabbed, SuiCap's window in front).
+    fn follow_detected_game(&mut self) {
+        let Some(s) = self.live.settings() else { return };
+        let Some((pid, exe)) = detected_game(&s) else { return };
+        if self.foreground.as_ref().is_some_and(|(p, _)| *p == pid) {
+            return;
+        }
+        self.foreground = Some((pid, exe));
+        self.apply_routes();
     }
 
     /// Take the apps per track from the latest settings. `rescan` then stops the sources that
@@ -1473,6 +1479,23 @@ mod tests {
         let (pos, out) = t.pop(960);
         assert_eq!(pos, 960);
         assert!(out[a].iter().all(|&x| x == 3.0));
+    }
+
+    #[test]
+    fn chunk_wholly_before_emit_is_dropped_without_panicking() {
+        // A source delayed past the mix latency delivers audio the mix already emitted.
+        // `pos + skip - emit_pos` went negative and wrapped to a huge usize (capacity overflow).
+        for samples in [chunk(480, 9.0), Vec::new()] {
+            let mut t = Timeline::new(START);
+            let a = t.add_line();
+            let _ = t.pop(4_800);
+            t.push_chunk(a, us(0), 480, &samples); // ends 4320 frames before emit_pos
+            assert_eq!(t.late_samples(), 480);
+            t.push(a, us(4_800), &chunk(480, 1.0)); // the next on-time chunk lands normally
+            let (pos, out) = t.pop(480);
+            assert_eq!(pos, 4_800);
+            assert!(out[a].iter().all(|&x| x == 1.0));
+        }
     }
 
     #[test]

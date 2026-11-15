@@ -217,6 +217,7 @@ pub const MEDIA_APPS: [&str; 6] = [
 const MAX_APPS: usize = 32;
 /// Parked apps are not recorded, so the list may hold more than a track does.
 const MAX_IGNORED: usize = 64;
+const MAX_DISMISSED: usize = 128;
 
 /// Which tracks are recorded. Game, Voice and Media off means **mute**: their apps are not
 /// captured at all, so they are not in the Mix either. Mix off only drops the combined track.
@@ -252,10 +253,15 @@ pub struct AudioSettings {
     pub tracks: AudioTracks,
     /// Apps that are never recorded: they win over every track list.
     pub ignored: Vec<String>,
-    /// Empty = the fullscreen app in the foreground when capture starts.
+    /// Empty = the detected game (full screen in any mode, or a known game in a window),
+    /// followed while capture runs.
     pub game: Vec<String>,
     pub voice: Vec<String>,
     pub media: Vec<String>,
+    /// Put an app that is playing sound and sits on no list onto a track by itself.
+    pub auto_add: bool,
+    /// Apps the user removed from every list on purpose: never added automatically again.
+    pub dismissed: Vec<String>,
 }
 
 impl Default for AudioSettings {
@@ -270,6 +276,8 @@ impl Default for AudioSettings {
             game: Vec::new(),
             voice: own(&VOICE_APPS),
             media: own(&MEDIA_APPS),
+            auto_add: true,
+            dismissed: Vec::new(),
         }
     }
 }
@@ -567,6 +575,12 @@ impl Settings {
         }
         for name in &self.audio.ignored {
             check_app("ignored", name)?;
+        }
+        if self.audio.dismissed.len() > MAX_DISMISSED {
+            return invalid(format!("at most {MAX_DISMISSED} forgotten apps"));
+        }
+        for name in &self.audio.dismissed {
+            check_app("forgotten", name)?;
         }
         if self.clips_quota_gb > MAX_QUOTA_GB {
             return invalid(format!("the clip storage limit is at most {MAX_QUOTA_GB} GB"));

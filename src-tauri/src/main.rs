@@ -2,6 +2,7 @@
 //! work lives in `suicap-core`; this crate only drives it.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autoadd;
 mod badge;
 mod commands;
 mod feedback;
@@ -64,7 +65,32 @@ pub fn register_hotkeys(app: &AppHandle) {
         .update_status(app, |st| st.hotkey_errors = errors);
 }
 
+/// Release builds abort on panic and have no console, so the message would be lost: append it
+/// (thread, location, message) to `%APPDATA%\SuiCap\crash.log` before the default hook runs.
+fn install_crash_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = config::settings_path().map(|p| p.with_file_name("crash.log")) {
+            use std::io::Write;
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
+            let bt = std::backtrace::Backtrace::force_capture();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(
+                    f,
+                    "[unix {secs}] v{} thread '{thread}' {info}\n{bt}\n",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+        }
+        default(info);
+    }));
+}
+
 fn main() {
+    install_crash_log();
     let autostarted = std::env::args().any(|a| a == "--autostart");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -159,6 +185,7 @@ fn main() {
                 let h = handle.clone();
                 std::thread::spawn(move || h.state::<AppState>().arm(&h));
             }
+            autoadd::start(&handle);
             if !autostarted {
                 tray::open_settings(&handle);
             }
@@ -170,8 +197,12 @@ fn main() {
     app.run(|app, event| match event {
         // Closing the last window keeps the app in the tray.
         RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
-        // Quit: stop capture so saves in progress finish their files.
-        RunEvent::Exit => app.state::<AppState>().disarm(app),
+        RunEvent::ExitRequested { code: Some(_), .. } => tray::shutdown(app),
+        // Quit: close the overlay immediately and stop capture so saves in progress finish.
+        RunEvent::Exit => {
+            tray::shutdown(app);
+            app.state::<AppState>().disarm(app);
+        }
         _ => {}
     });
 }

@@ -51,6 +51,10 @@ export interface Settings {
     game: string[];
     voice: string[];
     media: string[];
+    /** Put an app that plays sound and is on no list onto a track by itself. */
+    auto_add: boolean;
+    /** Apps removed on purpose: never added automatically again. */
+    dismissed: string[];
   };
   hotkeys: { save_15: string; save_30: string; save_60: string; save_full: string; screenshot: string; target_app: string };
   save_sound: boolean;
