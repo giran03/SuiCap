@@ -30,12 +30,29 @@ export interface WindowInfo {
   height: number;
 }
 
+export type RecordingMode = "replay" | "continuous";
+
+export interface ContinuousSettings {
+  segment_mins: number;
+  segment_mb: number;
+  max_mins: number;
+  wait_for_source: boolean;
+  split_on_app_change: boolean;
+  idle_pause_mins: number;
+  min_free_gb: number;
+  keep_replay_buffer: boolean;
+  notify_on_split: boolean;
+}
+
 export interface Settings {
   preset: PresetName;
   custom: { width: number; height: number; fps: number; codec: Codec | null; quality: number };
+  mode: RecordingMode;
+  continuous: ContinuousSettings;
   buffer_secs: number;
   container: "mp4" | "mkv";
   clips_dir: string | null;
+  temp_dir: string | null;
   cursor: boolean;
   display: number | null;
   source: SourceSettings;
@@ -56,7 +73,16 @@ export interface Settings {
     /** Apps removed on purpose: never added automatically again. */
     dismissed: string[];
   };
-  hotkeys: { save_15: string; save_30: string; save_60: string; save_full: string; screenshot: string; target_app: string };
+  hotkeys: {
+    save_15: string;
+    save_30: string;
+    save_60: string;
+    save_full: string;
+    screenshot: string;
+    target_app: string;
+    record_toggle: string;
+    record_pause: string;
+  };
   save_sound: boolean;
   save_toast: boolean;
   autostart: boolean;
@@ -92,6 +118,7 @@ export type Phase = "idle" | "starting" | "armed" | "recovering" | "error";
 
 export interface Status {
   phase: Phase;
+  mode: RecordingMode;
   encoder: string;
   resolution: string;
   source: string;
@@ -100,7 +127,13 @@ export interface Status {
   buffered_mb: number;
   buffer_estimate_mb: number;
   recording: boolean;
+  recording_paused: boolean;
+  waiting_for_source: boolean;
   recording_secs: number;
+  segment_secs: number;
+  segment_bytes: number;
+  session_bytes: number;
+  segment_index: number;
   frames: number;
   dropped: number;
   error: string | null;
@@ -173,6 +206,21 @@ export interface CodecSupport {
   problem: string | null;
 }
 
+export interface VideoPreview {
+  frame: string | null;
+  kind: "display" | "window" | "waiting";
+  exe: string | null;
+  title: string | null;
+  source_width: number;
+  source_height: number;
+  output_width: number;
+  output_height: number;
+  fps: number;
+  monitor_label: string;
+  fallback_active: boolean;
+  note: string | null;
+}
+
 let audioAppsInflight: Promise<AudioApp[]> | null = null;
 let audioAppsCache: { at: number; data: AudioApp[] } | null = null;
 
@@ -200,14 +248,21 @@ export const api = {
   saveClip: (secs: number | null) => invoke<void>("save_clip", { secs }),
   recordStart: () => invoke<void>("record_start"),
   recordStop: () => invoke<void>("record_stop"),
+  recordPause: () => invoke<void>("record_pause"),
+  recordSplit: () => invoke<void>("record_split"),
   configGet: () => invoke<Settings>("config_get"),
   configSet: (settings: Settings) => invoke<Status>("config_set", { settings }),
   defaultClipsDir: () => invoke<string>("default_clips_dir"),
+  defaultTempDir: () => invoke<string>("default_temp_dir"),
   displays: () => invoke<Display[]>("displays"),
   estimateMb: (settings: Settings) => invoke<number>("estimate_mb", { settings }),
   openClipsFolder: () => invoke<void>("open_clips_folder"),
+  openTempFolder: () => invoke<void>("open_temp_folder"),
+  videoPreview: (settings: Settings) => invoke<VideoPreview>("video_preview", { settings }),
+  closeVideoPreview: () => invoke<void>("close_video_preview"),
   revealLastClip: () => invoke<void>("reveal_last_clip"),
   pickClipsDir: () => invoke<string | null>("pick_clips_dir"),
+  pickTempDir: () => invoke<string | null>("pick_temp_dir"),
   foregroundGame: () => invoke<string | null>("foreground_game"),
   captureWindows: () => invoke<WindowInfo[]>("capture_windows"),
   audioApps: fetchAudioApps,
@@ -261,9 +316,21 @@ export async function onClipsChanged(f: () => void): Promise<UnlistenFn> {
   return () => offs.forEach((off) => off());
 }
 
+export interface BadgeFlash {
+  kind: string;
+  label: string;
+  secs: number | null;
+  tone: "ok" | "rec" | "paused" | "err";
+  duration_ms: number;
+}
+
 /** A clip was saved; the payload is its length in seconds. */
 export function onClipFlash(f: (secs: number) => void): Promise<UnlistenFn> {
   return listen<number>("clip_flash", (e) => f(e.payload));
+}
+
+export function onBadgeFlash(f: (flash: BadgeFlash) => void): Promise<UnlistenFn> {
+  return listen<BadgeFlash>("badge_flash", (e) => f(e.payload));
 }
 
 export function onScreenshotFlash(f: () => void): Promise<UnlistenFn> {

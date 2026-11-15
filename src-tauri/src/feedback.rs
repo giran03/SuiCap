@@ -62,14 +62,38 @@ pub fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
-/// `toast_ok` is false when the badge already announced the clip.
-pub fn clip_saved(app: &AppHandle, settings: &Settings, name: &str, secs: f64, toast_ok: bool) {
-    if settings.save_sound {
+pub fn format_duration(secs: f64) -> String {
+    let s = secs.round().max(1.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else if s >= 60 {
+        format!("{}:{:02}", s / 60, s % 60)
+    } else {
+        format!("{s} s")
+    }
+}
+
+/// `toast_ok` is false when the badge already announced the saved file.
+pub fn media_saved(
+    app: &AppHandle,
+    settings: &Settings,
+    title_prefix: &str,
+    name: &str,
+    secs: f64,
+    play_sound: bool,
+    toast_ok: bool,
+) {
+    if play_sound && settings.save_sound {
         play_chime();
     }
     if settings.save_toast && toast_ok {
-        notify(app, &format!("Clip saved ({secs:.0} s)"), name);
+        notify(app, &format!("{title_prefix} ({})", format_duration(secs)), name);
     }
+}
+
+/// `toast_ok` is false when the badge already announced the clip.
+pub fn clip_saved(app: &AppHandle, settings: &Settings, name: &str, secs: f64, toast_ok: bool) {
+    media_saved(app, settings, "Clip saved", name, secs, true, toast_ok);
 }
 
 /// `toast_ok` is false when the badge already announced the screenshot.

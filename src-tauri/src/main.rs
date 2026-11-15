@@ -41,6 +41,16 @@ fn is_screenshot_key(app: &AppHandle, shortcut: &Shortcut) -> bool {
     !key.is_empty() && Shortcut::from_str(&key).is_ok_and(|s| s == *shortcut)
 }
 
+fn is_record_toggle_key(app: &AppHandle, shortcut: &Shortcut) -> bool {
+    let key = app.state::<AppState>().settings().hotkeys.record_toggle;
+    !key.is_empty() && Shortcut::from_str(&key).is_ok_and(|s| s == *shortcut)
+}
+
+fn is_record_pause_key(app: &AppHandle, shortcut: &Shortcut) -> bool {
+    let key = app.state::<AppState>().settings().hotkeys.record_pause;
+    !key.is_empty() && Shortcut::from_str(&key).is_ok_and(|s| s == *shortcut)
+}
+
 /// (Re)register the save shortcuts; failures (a key taken by another app) are shown
 /// in the settings window.
 pub fn register_hotkeys(app: &AppHandle) {
@@ -110,6 +120,13 @@ fn main() {
                     } else if is_screenshot_key(app, shortcut) {
                         let app = app.clone();
                         std::thread::spawn(move || app.state::<AppState>().screenshot(&app));
+                    } else if is_record_toggle_key(app, shortcut) {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let _ = app.state::<AppState>().record_toggle(&app);
+                        });
+                    } else if is_record_pause_key(app, shortcut) {
+                        let _ = app.state::<AppState>().record_pause();
                     }
                 })
                 .build(),
@@ -127,14 +144,21 @@ fn main() {
             commands::save_clip,
             commands::record_start,
             commands::record_stop,
+            commands::record_pause,
+            commands::record_split,
             commands::config_get,
             commands::config_set,
             commands::default_clips_dir,
+            commands::default_temp_dir,
             commands::displays,
             commands::estimate_mb,
             commands::open_clips_folder,
+            commands::open_temp_folder,
+            commands::video_preview,
+            commands::close_video_preview,
             commands::reveal_last_clip,
             commands::pick_clips_dir,
+            commands::pick_temp_dir,
             commands::audio_apps,
             commands::audio_inputs,
             commands::foreground_game,
@@ -174,8 +198,20 @@ fn main() {
                 .video_dir()
                 .or_else(|_| app.path().home_dir())?
                 .join("SuiCap");
+            let temp = app
+                .path()
+                .local_data_dir()
+                .map(|d| d.join("SuiCap").join("Temp"))
+                .unwrap_or_else(|_| std::env::temp_dir().join("SuiCap"));
             let (autostart, arm) = (settings.autostart, settings.arm_on_start);
-            app.manage(AppState::new(settings, warning, path, clips));
+            app.manage(AppState::new(settings, warning, path, clips, temp));
+            let state = handle.state::<AppState>();
+            suicap_core::mux::set_temp_dir(Some(state.temp_dir()));
+            let removed = suicap_core::clips::cleanup_temp_files(&state.clips_dir())
+                + suicap_core::clips::cleanup_temp_files(&state.temp_dir());
+            if removed > 0 {
+                eprintln!("cleaned up {removed} leftover temporary clip file(s)");
+            }
             tray::create(&handle)?;
             power::watch(&handle);
             register_hotkeys(&handle);

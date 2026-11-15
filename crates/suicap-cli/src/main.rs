@@ -390,12 +390,22 @@ fn session(args: &[String]) -> Result<(), String> {
             }
             SessionEvent::SaveFailed(m) => println!("[{t:8.1}] save failed: {m}"),
             SessionEvent::RecordingStarted => println!("[{t:8.1}] recording started"),
+            SessionEvent::RecordingPaused(p) => {
+                println!("[{t:8.1}] recording {}", if p { "paused" } else { "resumed" });
+            }
+            SessionEvent::SegmentSaved(c) => println!(
+                "[{t:8.1}] segment saved {} ({} packets, {:.1} s)",
+                c.path.display(),
+                c.packets,
+                (c.last_pts_us - c.first_pts_us) as f64 / 1e6
+            ),
             SessionEvent::RecordingSaved(c) => println!(
                 "[{t:8.1}] recording saved {} ({} packets, {:.1} s)",
                 c.path.display(),
                 c.packets,
                 (c.last_pts_us - c.first_pts_us) as f64 / 1e6
             ),
+            SessionEvent::RecordingStoppedReason(r) => println!("[{t:8.1}] recording stopped: {r}"),
             SessionEvent::RecordingFailed(m) => println!("[{t:8.1}] recording failed: {m}"),
             SessionEvent::ScreenshotTaken(_) => {}
             SessionEvent::ScreenshotSaved(p) => println!("[{t:8.1}] screenshot {}", p.display()),
@@ -406,6 +416,8 @@ fn session(args: &[String]) -> Result<(), String> {
     };
     let session = Session::start(
         SessionOptions {
+            mode: suicap_core::config::RecordingMode::Replay,
+            continuous: suicap_core::config::ContinuousSettings::default(),
             buffer_secs,
             video,
             audio,

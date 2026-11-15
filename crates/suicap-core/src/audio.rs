@@ -592,7 +592,12 @@ pub fn foreground_game_exe() -> Option<String> {
 fn detected_game(s: &crate::config::AudioSettings) -> Option<(u32, String)> {
     let g = crate::game::detect()?;
     let exe = g.window.exe;
-    let listed = s.voice.iter().chain(&s.media).chain(&s.ignored).any(|n| n.eq_ignore_ascii_case(&exe));
+    let listed = s
+        .voice
+        .iter()
+        .chain(&s.media)
+        .chain(&s.ignored)
+        .any(|n| n.eq_ignore_ascii_case(&exe));
     (!listed).then_some((g.window.pid, exe))
 }
 

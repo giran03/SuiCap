@@ -10,7 +10,7 @@
 A GPU replay-buffer recorder for Windows, with a separate audio track for every part of your session.
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-3ba7ff?style=flat-square)
-![Version](https://img.shields.io/badge/version-0.1.0-30d158?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.1.2-30d158?style=flat-square)
 ![Rust](https://img.shields.io/badge/Rust-3ba7ff?style=flat-square&logo=rust&logoColor=white)
 ![Tauri](https://img.shields.io/badge/Tauri-30d158?style=flat-square&logo=tauri&logoColor=white)
 ![Svelte](https://img.shields.io/badge/Svelte-ff9f0a?style=flat-square&logo=svelte&logoColor=white)
@@ -37,8 +37,8 @@ A GPU replay-buffer recorder for Windows, with a separate audio track for every 
 <tr>
 <td width="50%" valign="top">
 
-### ⏪ Replay buffer
-Keeps the last 10 seconds to 10 minutes in memory as compressed video. Press a shortcut and the moment is saved, after it happened.
+### ⏪ Replay buffer & continuous recording
+Keep the last 10 seconds to 10 minutes in memory and save with a shortcut after the moment happens — or switch to **Continuous** mode to record straight to disk with gapless auto-splitting by time or file size, pause/resume, idle auto-pause, and disk space protection.
 
 </td>
 <td width="50%" valign="top">
@@ -73,8 +73,8 @@ AV1, HEVC or H.264 on your GPU, with the buffer kept as compressed packets so me
 
 [![The SuiCap dashboard: replay status, buffer and files, shortcuts, the video source picker and the audio board](docs/media/overview.webp)](docs/media/overview.webp)
 
-### ⏪ Replay and video
-The replay panel shows what is buffered and how much memory it uses, with save buttons for 15, 30 and 60 seconds or the whole buffer. Presets cover most setups, and Custom lets you pick resolution, frame rate, codec and quality.
+### ⏪ Replay, continuous recording, and preview
+The top-left panel lets you switch between **Replay** and **Continuous** recording, save recent highlights or manage active segments, and check the live **Preview** card above the Video settings to verify framing and aspect ratio before you hit record. Presets cover most setups, and Custom lets you pick resolution, frame rate, codec and quality.
 
 [![The dashboard header and panels at 1280 by 860](docs/media/dashboard.webp)](docs/media/dashboard.webp)
 
@@ -99,12 +99,13 @@ The replay panel shows what is buffered and how much memory it uses, with save b
 
 ### ⚙️ Settings
 
-General, Appearance, Updates and About live in a window that opens over the dashboard. Updates are checked against the release checksum before they run.
+General, Storage, Appearance, Updates and About live in a window that opens over the dashboard. Choose custom folders for finished clips and temporary recording files, manage retention limits, customize the recording badge, and verify updates against the release checksum before they run.
 
 ### ⌨️ Shortcuts
 
 | Action | Default |
 |---|---|
+| Start or stop continuous recording | `Ctrl+Alt+F6` |
 | Save the last 15 / 30 / 60 seconds | `Ctrl+Alt+F9` / `F10` / `F11` |
 | Save the whole buffer | `Ctrl+Alt+F12` |
 | Take a screenshot | `Ctrl+Alt+F8` |

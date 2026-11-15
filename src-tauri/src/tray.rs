@@ -198,10 +198,20 @@ fn icon_image(phase: Phase) -> Image<'static> {
 }
 
 fn tooltip(st: &Status) -> String {
+    let cont = st.mode == suicap_core::config::RecordingMode::Continuous;
     match st.phase {
+        Phase::Armed if st.recording && st.recording_paused => {
+            format!("SuiCap: paused ({})", format_duration(st.segment_secs))
+        }
+        Phase::Armed if st.recording && cont => {
+            format!("SuiCap: recording ({})", format_duration(st.segment_secs))
+        }
+        Phase::Armed if cont && st.waiting_for_source => "SuiCap: waiting for source".into(),
+        Phase::Armed if cont => "SuiCap: continuous ready".into(),
         Phase::Armed => format!("SuiCap: replay on ({} s)", st.buffer_secs),
         Phase::Starting => "SuiCap: starting".into(),
         Phase::Recovering => "SuiCap: restarting capture".into(),
+        Phase::Idle if cont => "SuiCap: continuous off".into(),
         Phase::Idle => "SuiCap: replay off".into(),
         Phase::Error => "SuiCap: capture stopped (open for details)".into(),
     }
@@ -300,6 +310,7 @@ pub fn open_settings(app: &AppHandle) {
                 w.on_window_event(|event| {
                     if matches!(event, WindowEvent::Destroyed) {
                         suicap_core::apps::clear_caches();
+                        suicap_core::pipeline::clear_preview_cache();
                         crate::commands::clear_icon_cache();
                     }
                 });
@@ -402,6 +413,8 @@ enum MenuAction {
     Save(Option<u32>),
     RecordStart,
     RecordStop,
+    RecordPause,
+    RecordSplit,
     Arm,
     Disarm,
     OpenClips,
@@ -433,12 +446,19 @@ fn format_duration(secs: f64) -> String {
 }
 
 fn build_menu_model(st: &Status) -> MenuModel {
+    let cont = st.mode == suicap_core::config::RecordingMode::Continuous;
     let armed = st.phase == Phase::Armed;
     let busy = matches!(st.phase, Phase::Starting | Phase::Recovering);
     let recording = armed && st.recording;
 
     let headline = match st.phase {
+        Phase::Armed if st.recording && st.recording_paused => {
+            format!("Paused \u{00b7} {}", format_duration(st.segment_secs))
+        }
+        Phase::Armed if st.recording && cont => format!("Recording \u{00b7} {}", format_duration(st.segment_secs)),
         Phase::Armed if st.recording => format!("Recording \u{00b7} {}", format_duration(st.recording_secs)),
+        Phase::Armed if cont && st.waiting_for_source => "Waiting for source".into(),
+        Phase::Armed if cont => "Continuous ready".into(),
         Phase::Armed => format!(
             "Replay on \u{00b7} {:.0} of {} s",
             st.buffered_secs.min(f64::from(st.buffer_secs)),
@@ -447,6 +467,7 @@ fn build_menu_model(st: &Status) -> MenuModel {
         Phase::Starting => "Starting capture\u{2026}".into(),
         Phase::Recovering => "Restarting capture\u{2026}".into(),
         Phase::Error => "Capture stopped".into(),
+        Phase::Idle if cont => "Continuous off".into(),
         Phase::Idle => "Replay off".into(),
     };
 
@@ -458,10 +479,11 @@ fn build_menu_model(st: &Status) -> MenuModel {
         disabled,
     };
 
-    let record_item = if recording {
+    let stopping = recording || (cont && armed && st.waiting_for_source);
+    let record_item = if stopping {
         MenuItem {
             label: "Stop recording",
-            hint: Some(format_duration(st.recording_secs)),
+            hint: recording.then(|| format_duration(st.recording_secs)),
             action: MenuAction::RecordStop,
             danger: true,
             disabled: false,
@@ -470,16 +492,41 @@ fn build_menu_model(st: &Status) -> MenuModel {
         item("Start recording", MenuAction::RecordStart, !armed)
     };
 
-    let toggle_item = if armed || busy {
-        item("Turn replay off", MenuAction::Disarm, false)
-    } else {
-        item("Turn replay on", MenuAction::Arm, false)
+    let toggle_item = match (cont, armed || busy) {
+        (true, true) => item("Turn capture off", MenuAction::Disarm, false),
+        (true, false) => item("Turn capture on", MenuAction::Arm, false),
+        (false, true) => item("Turn replay off", MenuAction::Disarm, false),
+        (false, false) => item("Turn replay on", MenuAction::Arm, false),
     };
 
-    MenuModel {
-        phase: st.phase,
-        headline,
-        items: [
+    let top_items = if cont {
+        let pause_item = if recording && st.recording_paused {
+            item("Resume recording", MenuAction::RecordPause, false)
+        } else {
+            item("Pause recording", MenuAction::RecordPause, !recording)
+        };
+        let split_item = MenuItem {
+            label: "Split segment now",
+            hint: (st.segment_index > 0).then(|| format!("pt {:02}", st.segment_index)),
+            action: MenuAction::RecordSplit,
+            danger: false,
+            disabled: !recording || st.recording_paused,
+        };
+        let has_buf = armed && st.buffered_secs > 0.0;
+        [
+            pause_item,
+            split_item,
+            item("Save last 30 s", MenuAction::Save(Some(30)), !has_buf),
+            MenuItem {
+                label: "Save whole buffer",
+                hint: Some(format!("{} s", st.buffer_secs)),
+                action: MenuAction::Save(None),
+                danger: false,
+                disabled: !has_buf,
+            },
+        ]
+    } else {
+        [
             item("Save last 15 s", MenuAction::Save(Some(15)), !armed),
             item("Save last 30 s", MenuAction::Save(Some(30)), !armed),
             item("Save last 60 s", MenuAction::Save(Some(60)), !armed),
@@ -490,6 +537,18 @@ fn build_menu_model(st: &Status) -> MenuModel {
                 danger: false,
                 disabled: !armed,
             },
+        ]
+    };
+    let [i0, i1, i2, i3] = top_items;
+
+    MenuModel {
+        phase: st.phase,
+        headline,
+        items: [
+            i0,
+            i1,
+            i2,
+            i3,
             record_item,
             toggle_item,
             item("Open clips folder", MenuAction::OpenClips, false),
@@ -1270,6 +1329,12 @@ fn execute_action(app: &AppHandle, action: MenuAction) {
         MenuAction::RecordStop => {
             let _ = app.state::<AppState>().record_stop();
         }
+        MenuAction::RecordPause => {
+            let _ = app.state::<AppState>().record_pause();
+        }
+        MenuAction::RecordSplit => {
+            let _ = app.state::<AppState>().record_split();
+        }
         MenuAction::Arm => app.state::<AppState>().arm(app),
         MenuAction::Disarm => app.state::<AppState>().disarm(app),
         MenuAction::OpenClips => {
@@ -1609,6 +1674,41 @@ mod tests {
         assert!(rec.items[4].danger);
         assert!(!rec.items[4].disabled);
         assert_eq!(rec.items[5].label, "Turn replay off");
+    }
+
+    #[test]
+    fn menu_model_tracks_continuous_mode() {
+        use suicap_core::config::RecordingMode;
+        let idle = build_menu_model(&Status {
+            phase: Phase::Idle,
+            mode: RecordingMode::Continuous,
+            buffer_secs: 120,
+            ..Default::default()
+        });
+        assert_eq!(idle.headline, "Continuous off");
+        assert_eq!(idle.items[0].label, "Pause recording");
+        assert!(idle.items[0].disabled);
+        assert!(idle.items[1].disabled);
+        assert_eq!(idle.items[5].label, "Turn capture on");
+
+        let paused = build_menu_model(&Status {
+            phase: Phase::Armed,
+            mode: RecordingMode::Continuous,
+            recording: true,
+            recording_paused: true,
+            recording_secs: 125.0,
+            segment_secs: 45.0,
+            segment_index: 2,
+            ..Default::default()
+        });
+        assert_eq!(paused.headline, "Paused \u{00b7} 0:45");
+        assert_eq!(paused.items[0].label, "Resume recording");
+        assert!(!paused.items[0].disabled);
+        assert!(paused.items[1].disabled);
+        assert_eq!(paused.items[1].hint.as_deref(), Some("pt 02"));
+        assert_eq!(paused.items[4].label, "Stop recording");
+        assert_eq!(paused.items[4].hint.as_deref(), Some("2:05"));
+        assert_eq!(paused.items[5].label, "Turn capture off");
     }
 
     #[test]

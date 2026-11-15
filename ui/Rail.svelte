@@ -3,14 +3,27 @@
 
   interface Props {
     scrollEl: HTMLElement | undefined;
+    mode?: "replay" | "continuous";
     armed: boolean;
+    recording?: boolean;
+    paused?: boolean;
     hasError: boolean;
     settingsOpen: boolean;
     upBadge: boolean;
     onOpenSettings: () => void;
   }
 
-  let { scrollEl, armed, hasError, settingsOpen, upBadge, onOpenSettings }: Props = $props();
+  let {
+    scrollEl,
+    mode = "replay",
+    armed,
+    recording = false,
+    paused = false,
+    hasError,
+    settingsOpen,
+    upBadge,
+    onOpenSettings,
+  }: Props = $props();
 
   const ITEMS = [
     {
@@ -180,10 +193,10 @@
         <span class="icon">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d={item.icon} /></svg>
           {#if item.id === "replay" && (armed || hasError)}
-            <i class="dot" class:live={armed} class:err={hasError} aria-hidden="true"></i>
+            <i class="dot" class:live={armed} class:rec={recording && !paused} class:paused={recording && paused} class:err={hasError} aria-hidden="true"></i>
           {/if}
         </span>
-        <span class="label">{item.label}</span>
+        <span class="label">{item.id === "replay" && mode === "continuous" ? "Record" : item.label}</span>
       </button>
     {/each}
   </nav>
@@ -379,6 +392,14 @@
   .dot.live {
     background: var(--accent);
     box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 70%, transparent);
+  }
+  .dot.rec {
+    background: #ef4444;
+    box-shadow: 0 0 8px color-mix(in srgb, #ef4444 70%, transparent);
+  }
+  .dot.paused {
+    background: #f59e0b;
+    box-shadow: 0 0 8px color-mix(in srgb, #f59e0b 65%, transparent);
   }
   .dot.err {
     background: var(--warn);

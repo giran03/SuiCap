@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -16,11 +16,10 @@ use crate::{
     buffer::{Packet, ReplayBuffer, VIDEO_STREAM},
     capture::{self, Adapter, CaptureError, CaptureSource, Output, Pacer, WgcSource},
     config::{self, Codec, VideoPreset},
-    game,
     encode::{
         self, Encoder, EncoderSettings, HwDevice, HwFrame, HwFrames, MAX_FRAMES_IN_FLIGHT, Sent, StreamParams, SwFormat,
     },
-    fault,
+    fault, game,
     mux::{self, ClipInfo, MuxError, MuxStream, Muxer},
     preprocess::{PreprocessError, Preprocessor},
     shot, targets,
@@ -116,6 +115,8 @@ pub struct VideoStats {
     pub codec: Option<Codec>,
     pub width: u32,
     pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
     pub fps: u32,
     pub source: String,
     /// What is being recorded now: "display", "window" or "waiting" (held frame).
@@ -335,7 +336,10 @@ impl Watch {
                 while !s.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1000));
                     let found = game::detect();
-                    f.store(found.as_ref().is_some_and(|g| g.mode.is_fullscreen()), Ordering::Release);
+                    f.store(
+                        found.as_ref().is_some_and(|g| g.mode.is_fullscreen()),
+                        Ordering::Release,
+                    );
                     if src.kind == config::SourceKind::Display {
                         continue;
                     }
@@ -529,11 +533,17 @@ impl VideoPath {
             ));
         }
         trace.mark("WGC session");
-        let first = match wait_first_frame(&mut src, Duration::from_secs(2)) {
-            Ok(f) => f,
+        let (first, source_dims) = match wait_first_frame(&mut src, Duration::from_secs(2)) {
+            Ok(f) => {
+                let dims = (f.width, f.height);
+                (f, dims)
+            }
             // An exclusive full-screen game can hold the monitor's frames back: start on black
             // instead of failing to arm; the stall watchdog recreates the source.
-            Err(PipelineError::NoFirstFrame(_)) => capture::Frame::black(&device)?,
+            Err(PipelineError::NoFirstFrame(_)) => (
+                capture::Frame::black(&device)?,
+                (output.width.max(1) as u32, output.height.max(1) as u32),
+            ),
             Err(e) => return Err(e),
         };
         let last = Some(convert(&mut pre, &frames, &first)?);
@@ -544,6 +554,8 @@ impl VideoPath {
             codec: Some(codec),
             width: preset.width,
             height: preset.height,
+            source_width: source_dims.0,
+            source_height: source_dims.1,
             fps: preset.fps,
             source: format!(
                 "WGC {} {}x{} @ {} Hz",
@@ -601,6 +613,25 @@ impl VideoPath {
         shot::read_nv12(&self.device, &ctx, &tex, slice, self.stats.width, self.stats.height).map_err(|e| e.to_string())
     }
 
+    /// Read a scaled preview of the newest encoded NV12 frame alongside live stats.
+    pub fn preview(&self, max_w: u32) -> std::result::Result<(shot::Image, VideoStats), String> {
+        let frame = self.last.as_ref().ok_or("no frame captured yet")?;
+        let (tex, slice) = frame.texture();
+        // SAFETY: the device is live; the immediate context is only used on this thread.
+        let ctx = unsafe { self.device.GetImmediateContext() }.map_err(|e| e.to_string())?;
+        let img = shot::read_nv12_scaled(
+            &self.device,
+            &ctx,
+            &tex,
+            slice,
+            self.stats.width,
+            self.stats.height,
+            max_w,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((img, self.stats.clone()))
+    }
+
     pub fn stream_params(&self) -> Result<StreamParams> {
         Ok(self.encoder.stream_params(self.stats.fps)?)
     }
@@ -619,6 +650,8 @@ impl VideoPath {
             self.stats.dropped += 1;
         } else {
             if let Some(f) = self.poll_source()? {
+                self.stats.source_width = f.width;
+                self.stats.source_height = f.height;
                 self.last = Some(convert(&mut self.pre, &self.frames, &f)?);
                 self.stats.fresh += 1;
                 self.last_fresh_us = tick.pts_us;
@@ -1021,6 +1054,8 @@ pub fn replay(opts: &ReplayOptions) -> Result<ReplayStats> {
 
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
+    pub mode: config::RecordingMode,
+    pub continuous: config::ContinuousSettings,
     pub buffer_secs: u32,
     pub video: VideoOptions,
     /// `None`: video only.
@@ -1040,11 +1075,22 @@ pub struct SessionStatus {
     /// Upper bound of buffer RAM at the max bitrate (plan §4.3).
     pub buffer_estimate_mb: u64,
     pub recording: bool,
+    pub recording_paused: bool,
+    pub waiting_for_source: bool,
+    /// Active recording seconds across the current session (excluding paused time).
     pub recording_secs: f64,
+    /// Active seconds and approximate encoded bytes of the current file segment.
+    pub segment_secs: f64,
+    pub segment_bytes: u64,
+    /// Total encoded bytes across the active continuous session.
+    pub session_bytes: u64,
+    pub segment_index: u32,
     /// What the video source is pointed at now, and the notes about it (these change live).
     pub capture_kind: &'static str,
     pub capture_exe: Option<String>,
     pub capture_title: Option<String>,
+    pub source_width: u32,
+    pub source_height: u32,
     pub source: String,
     pub notes: Vec<String>,
 }
@@ -1058,7 +1104,13 @@ pub enum SessionEvent {
     /// A save that produced no file (buffer still empty, or the write failed).
     SaveFailed(String),
     RecordingStarted,
+    /// Pause state changed (manual or idle auto-pause).
+    RecordingPaused(bool),
+    /// Intermediate segment finished on auto-split, manual split, app change, or waited source closing.
+    SegmentSaved(ClipInfo),
     RecordingSaved(ClipInfo),
+    /// Recording ended automatically due to max duration limit or low disk space after saving.
+    RecordingStoppedReason(String),
     RecordingFailed(String),
     ScreenshotTaken(PathBuf),
     ScreenshotSaved(PathBuf),
@@ -1074,6 +1126,13 @@ enum SessionCmd {
     Save(Option<u32>),
     RecordStart,
     RecordStop,
+    RecordTogglePause,
+    RecordSplit,
+    UpdateContinuous(config::ContinuousSettings),
+    Preview(
+        u32,
+        crossbeam_channel::Sender<std::result::Result<(shot::Image, VideoStats), String>>,
+    ),
     Screenshot,
     Stop,
 }
@@ -1118,9 +1177,34 @@ impl Session {
         self.cmd.try_send(SessionCmd::RecordStop).is_ok()
     }
 
+    /// Toggle pause on an active recording. Never blocks.
+    pub fn record_toggle_pause(&self) -> bool {
+        self.cmd.try_send(SessionCmd::RecordTogglePause).is_ok()
+    }
+
+    /// Cut the current continuous segment at the next keyframe and start the next file. Never blocks.
+    pub fn record_split(&self) -> bool {
+        self.cmd.try_send(SessionCmd::RecordSplit).is_ok()
+    }
+
+    /// Apply updated continuous settings live without restarting capture. Never blocks.
+    pub fn update_continuous(&self, continuous: config::ContinuousSettings) -> bool {
+        self.cmd.try_send(SessionCmd::UpdateContinuous(continuous)).is_ok()
+    }
+
     /// Save the newest frame as a PNG in the clips folder. Never blocks.
     pub fn screenshot(&self) -> bool {
         self.cmd.try_send(SessionCmd::Screenshot).is_ok()
+    }
+
+    /// Fetch a scaled preview of the newest captured frame from the running video thread.
+    pub fn preview(&self, max_w: u32) -> std::result::Result<(shot::Image, VideoStats), String> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.cmd
+            .try_send(SessionCmd::Preview(max_w, tx))
+            .map_err(|_| "preview busy".to_string())?;
+        rx.recv_timeout(Duration::from_millis(450))
+            .map_err(|_| "preview timed out".to_string())?
     }
 
     pub fn is_running(&self) -> bool {
@@ -1154,20 +1238,57 @@ fn clip_path(dir: &Path, ext: &str) -> std::io::Result<PathBuf> {
     let stem = name.trim_end_matches(&format!(".{ext}")).to_owned();
     let mut path = folder.join(&name);
     let mut n = 2;
-    while path.exists() || path.with_extension(format!("{ext}.tmp")).exists() {
+    while path.exists() || mux::temp_path(&path).is_ok_and(|t| t.exists()) {
         path = folder.join(format!("{stem}-{n}.{ext}"));
         n += 1;
     }
     Ok(path)
 }
 
+/// Output `(mkv_path, mp4_path)` for a continuous or manual recording segment, checking
+/// collisions against both `.mkv` and `.mp4` targets and their `.tmp` files.
+fn segment_clip_path(
+    dir: &Path,
+    app: &str,
+    part: Option<u32>,
+    container: config::Container,
+) -> std::io::Result<(PathBuf, Option<PathBuf>)> {
+    let app = mux::safe_app_name(app);
+    let folder = dir.join(&app);
+    std::fs::create_dir_all(&folder)?;
+    let name = mux::segment_file_name(&app, mux::local_time(), part, "mkv");
+    let stem = name.trim_end_matches(".mkv").to_owned();
+    let tmp_root = (container == config::Container::Mp4).then(mux::temp_dir).flatten();
+    if let Some(ref tr) = tmp_root {
+        std::fs::create_dir_all(tr)?;
+    }
+    let busy = |s: &str| {
+        let mkv = tmp_root.as_deref().unwrap_or(&folder).join(format!("{s}.mkv"));
+        let mp4 = folder.join(format!("{s}.mp4"));
+        mkv.exists()
+            || mux::temp_path(&mkv).is_ok_and(|t| t.exists())
+            || (container == config::Container::Mp4 && (mp4.exists() || mux::temp_path(&mp4).is_ok_and(|t| t.exists())))
+    };
+    let mut candidate = stem.clone();
+    let mut n = 2;
+    while busy(&candidate) {
+        candidate = format!("{stem}-{n}");
+        n += 1;
+    }
+    let mkv_path = tmp_root.as_deref().unwrap_or(&folder).join(format!("{candidate}.mkv"));
+    let mp4_path = (container == config::Container::Mp4).then(|| folder.join(format!("{candidate}.mp4")));
+    Ok((mkv_path, mp4_path))
+}
+
 /// Rebuild attempts after a runtime video failure before giving up (plan §7 row 2).
 const REBUILD_ATTEMPTS: u32 = 6;
+const NO_KEYFRAME_ERR: &str = "no video keyframe received before recording stopped";
 
 type Workers = Vec<std::thread::JoinHandle<mux::Result<ClipInfo>>>;
 type RecWorkers = Vec<(
     std::thread::JoinHandle<std::result::Result<ClipInfo, String>>,
     Option<String>,
+    bool,
 )>;
 
 type Shots = Vec<std::thread::JoinHandle<std::result::Result<PathBuf, String>>>;
@@ -1189,31 +1310,71 @@ fn reap_shots(shots: &mut Shots, all: bool, on_event: &dyn Fn(SessionEvent)) {
 
 const RECORD_QUEUE_CAPACITY: usize = 512;
 
-struct Recorder {
-    tx: crossbeam_channel::Sender<Packet>,
-    thread: std::thread::JoinHandle<std::result::Result<ClipInfo, String>>,
-    started_at: std::time::Instant,
+enum RecMsg {
+    Packet(Packet),
+    SetPaused(bool),
 }
 
-fn spawn_recorder(mkv_path: PathBuf, mp4_path: Option<PathBuf>, streams: Vec<MuxStream>) -> std::io::Result<Recorder> {
-    let (tx, rx) = crossbeam_channel::bounded::<Packet>(RECORD_QUEUE_CAPACITY);
+#[derive(Default)]
+struct RecorderStats {
+    active_us: AtomicI64,
+    bytes: AtomicU64,
+    packets: AtomicU64,
+}
+
+struct Recorder {
+    tx: crossbeam_channel::Sender<RecMsg>,
+    thread: std::thread::JoinHandle<std::result::Result<ClipInfo, String>>,
+    stats: Arc<RecorderStats>,
+    app: String,
+    paused: bool,
+    index: u32,
+}
+
+impl Recorder {
+    fn active_us(&self) -> i64 {
+        self.stats.active_us.load(Ordering::Relaxed)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.stats.bytes.load(Ordering::Relaxed)
+    }
+
+    fn packets(&self) -> u64 {
+        self.stats.packets.load(Ordering::Relaxed)
+    }
+}
+
+fn spawn_recorder(
+    mkv_path: PathBuf,
+    mp4_path: Option<PathBuf>,
+    streams: Vec<MuxStream>,
+    app: String,
+    index: u32,
+) -> std::io::Result<Recorder> {
+    let (tx, rx) = crossbeam_channel::bounded::<RecMsg>(RECORD_QUEUE_CAPACITY);
+    let stats = Arc::new(RecorderStats::default());
+    let worker_stats = Arc::clone(&stats);
     let thread = std::thread::Builder::new()
         .name("suicap-record".into())
         .spawn(move || {
             let mut mux = Muxer::create(&mkv_path, &streams).map_err(|e| e.to_string())?;
-            let mut rb = mux::Rebaser::default();
-            let (mut first, mut last) = (None, 0);
-            for p in rx.iter() {
-                if let Some((pts, _)) = rb.apply(&p).filter(|_| p.stream == VIDEO_STREAM) {
-                    first.get_or_insert(pts);
-                    last = last.max(pts);
+            for msg in rx.iter() {
+                match msg {
+                    RecMsg::SetPaused(paused) => mux.set_paused(paused),
+                    RecMsg::Packet(p) => mux.write(&p).map_err(|e| e.to_string())?,
                 }
-                mux.write(&p).map_err(|e| e.to_string())?;
+                worker_stats
+                    .active_us
+                    .store(mux.active_duration_us(), Ordering::Relaxed);
+                worker_stats.bytes.store(mux.bytes, Ordering::Relaxed);
+                worker_stats.packets.store(mux.packets, Ordering::Relaxed);
             }
             let packets = mux.packets;
+            let active_us = mux.active_duration_us();
             if packets == 0 {
                 drop(mux);
-                return Err("no video keyframe received before recording stopped".into());
+                return Err(NO_KEYFRAME_ERR.into());
             }
             let mkv = mux.finish().map_err(|e| e.to_string())?;
             let final_path = match mp4_path {
@@ -1230,40 +1391,55 @@ fn spawn_recorder(mkv_path: PathBuf, mp4_path: Option<PathBuf>, streams: Vec<Mux
             Ok(ClipInfo {
                 path: final_path,
                 packets,
-                first_pts_us: first.unwrap_or(0),
-                last_pts_us: last,
+                first_pts_us: 0,
+                last_pts_us: active_us,
             })
         })?;
     Ok(Recorder {
         tx,
         thread,
-        started_at: std::time::Instant::now(),
+        stats,
+        app,
+        paused: false,
+        index,
     })
 }
 
-fn stop_recorder(recorder: &mut Option<Recorder>, rec_workers: &mut RecWorkers, err_override: Option<String>) {
+fn stop_recorder(
+    recorder: &mut Option<Recorder>,
+    rec_workers: &mut RecWorkers,
+    err_override: Option<String>,
+    is_split: bool,
+) {
     if let Some(rec) = recorder.take() {
         drop(rec.tx);
-        rec_workers.push((rec.thread, err_override));
+        rec_workers.push((rec.thread, err_override, is_split));
     }
 }
 
-fn send_record_packet(recorder: &mut Option<Recorder>, rec_workers: &mut RecWorkers, p: Packet) {
+fn send_record_msg(recorder: &mut Option<Recorder>, rec_workers: &mut RecWorkers, msg: RecMsg, is_split: bool) {
     let Some(rec) = recorder.as_ref() else {
         return;
     };
-    match rec.tx.try_send(p) {
+    match rec.tx.try_send(msg) {
         Ok(()) => {}
         Err(crossbeam_channel::TrySendError::Full(_)) => {
             stop_recorder(
                 recorder,
                 rec_workers,
                 Some("recording writer fell behind; stopped recording".into()),
+                is_split,
             );
         }
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-            stop_recorder(recorder, rec_workers, None);
+            stop_recorder(recorder, rec_workers, None, is_split);
         }
+    }
+}
+
+fn send_record_packet(recorder: &mut Option<Recorder>, rec_workers: &mut RecWorkers, p: Packet) {
+    if recorder.as_ref().is_some_and(|r| !r.paused) {
+        send_record_msg(recorder, rec_workers, RecMsg::Packet(p), false);
     }
 }
 
@@ -1271,13 +1447,20 @@ fn reap_recordings(workers: &mut RecWorkers, all: bool, on_event: &dyn Fn(Sessio
     let mut i = 0;
     while i < workers.len() {
         if all || workers[i].0.is_finished() {
-            let (handle, err_override) = workers.swap_remove(i);
+            let (handle, err_override, is_split) = workers.swap_remove(i);
             let res = handle.join();
             if let Some(msg) = err_override {
                 on_event(SessionEvent::RecordingFailed(msg));
             } else {
                 match res {
-                    Ok(Ok(clip)) => on_event(SessionEvent::RecordingSaved(clip)),
+                    Ok(Ok(clip)) => {
+                        if is_split {
+                            on_event(SessionEvent::SegmentSaved(clip));
+                        } else {
+                            on_event(SessionEvent::RecordingSaved(clip));
+                        }
+                    }
+                    Ok(Err(e)) if is_split && e == NO_KEYFRAME_ERR => {}
                     Ok(Err(e)) => on_event(SessionEvent::RecordingFailed(e)),
                     Err(_) => on_event(SessionEvent::RecordingFailed("recording worker panicked".into())),
                 }
@@ -1328,6 +1511,221 @@ fn armed_event(v: &VideoPath, extra: &[String]) -> SessionEvent {
     SessionEvent::Armed(stats)
 }
 
+fn app_stem(exe: &str) -> &str {
+    exe.strip_suffix(".exe")
+        .or_else(|| exe.strip_suffix(".EXE"))
+        .unwrap_or(exe)
+}
+
+fn current_app(stats: &VideoStats) -> String {
+    let raw = if stats.capture_kind == "window" {
+        stats.capture_exe.as_deref().map(app_stem).map(str::to_owned)
+    } else {
+        crate::audio::foreground_app_name()
+    };
+    mux::safe_app_name(&raw.unwrap_or_default())
+}
+
+fn source_ready_for_continuous(source: &config::SourceSettings, wait_for_source: bool, capture_kind: &str) -> bool {
+    if !wait_for_source {
+        return true;
+    }
+    match source.kind {
+        config::SourceKind::Display => true,
+        config::SourceKind::App => capture_kind == "window" || (source.fallback && capture_kind == "display"),
+        config::SourceKind::Auto => capture_kind == "window",
+    }
+}
+
+fn idle_seconds() -> Option<u32> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut lii = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    // SAFETY: lii.cbSize matches LASTINPUTINFO size.
+    unsafe {
+        if !GetLastInputInfo(&mut lii).as_bool() {
+            return None;
+        }
+        Some(GetTickCount().wrapping_sub(lii.dwTime) / 1000)
+    }
+}
+
+fn free_disk_bytes(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut probe = Some(dir);
+    let existing = loop {
+        match probe {
+            Some(p) if p.exists() => break p,
+            Some(p) => probe = p.parent(),
+            None => return None,
+        }
+    };
+    let wide: Vec<u16> = existing.as_os_str().encode_wide().chain([0]).collect();
+    let mut free_avail = 0u64;
+    // SAFETY: wide is NUL-terminated UTF-16 pointing to an existing path; free_avail is valid output storage.
+    unsafe { GetDiskFreeSpaceExW(windows::core::PCWSTR(wide.as_ptr()), Some(&mut free_avail), None, None) }.ok()?;
+    Some(free_avail)
+}
+
+struct ContinuousRun {
+    is_continuous: bool,
+    continuous: config::ContinuousSettings,
+    auto_record: bool,
+    manual_paused: bool,
+    idle_paused: bool,
+    waiting_for_source: bool,
+    prior_active_us: i64,
+    prior_bytes: u64,
+    segment_index: u32,
+    split_pending: bool,
+}
+
+impl ContinuousRun {
+    fn new(opts: &SessionOptions) -> Self {
+        let is_continuous = opts.mode == config::RecordingMode::Continuous;
+        Self {
+            is_continuous,
+            continuous: opts.continuous.clone(),
+            auto_record: is_continuous,
+            manual_paused: false,
+            idle_paused: false,
+            waiting_for_source: false,
+            prior_active_us: 0,
+            prior_bytes: 0,
+            segment_index: 0,
+            split_pending: false,
+        }
+    }
+
+    fn keep_buffer(&self) -> bool {
+        !self.is_continuous || self.continuous.keep_replay_buffer
+    }
+
+    fn effective_paused(&self) -> bool {
+        self.manual_paused || self.idle_paused
+    }
+
+    fn accumulate_and_stop(&mut self, recorder: &mut Option<Recorder>, rec_workers: &mut RecWorkers, is_split: bool) {
+        if let Some(rec) = recorder.as_ref() {
+            self.prior_active_us += rec.active_us();
+            self.prior_bytes += rec.bytes();
+        }
+        stop_recorder(recorder, rec_workers, None, is_split);
+        self.split_pending = false;
+    }
+
+    fn check_disk_space(
+        &mut self,
+        clips_dir: &Path,
+        recorder: &mut Option<Recorder>,
+        rec_workers: &mut RecWorkers,
+        on_event: &dyn Fn(SessionEvent),
+    ) -> bool {
+        if !self.is_continuous {
+            return true;
+        }
+        let Some(free) = free_disk_bytes(clips_dir) else {
+            return true;
+        };
+        let min_bytes = u64::from(self.continuous.min_free_gb) << 30;
+        if free >= min_bytes {
+            return true;
+        }
+        let had_rec = recorder.is_some();
+        self.auto_record = false;
+        self.manual_paused = false;
+        self.idle_paused = false;
+        self.waiting_for_source = false;
+        if had_rec {
+            self.accumulate_and_stop(recorder, rec_workers, false);
+            on_event(SessionEvent::RecordingStoppedReason(format!(
+                "Free disk space fell below {} GB; recording stopped and saved.",
+                self.continuous.min_free_gb
+            )));
+        } else {
+            on_event(SessionEvent::RecordingFailed(format!(
+                "Free disk space is below the {} GB safety reserve.",
+                self.continuous.min_free_gb
+            )));
+        }
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_segment(
+        &mut self,
+        recorder: &mut Option<Recorder>,
+        rec_workers: &mut RecWorkers,
+        opts: &SessionOptions,
+        streams: &[MuxStream],
+        stats: &VideoStats,
+        emit_started: bool,
+        on_event: &dyn Fn(SessionEvent),
+    ) {
+        if !self.check_disk_space(&opts.clips_dir, recorder, rec_workers, on_event) {
+            return;
+        }
+        let app = current_app(stats);
+        let next_idx = self.segment_index + 1;
+        let part = self.is_continuous.then_some(next_idx);
+        match segment_clip_path(&opts.clips_dir, &app, part, opts.container) {
+            Ok((mkv_path, mp4_path)) => match spawn_recorder(mkv_path, mp4_path, streams.to_vec(), app, next_idx) {
+                Ok(rec) => {
+                    self.segment_index = next_idx;
+                    *recorder = Some(rec);
+                    if self.effective_paused() {
+                        apply_pause(recorder, rec_workers, true, on_event);
+                    }
+                    if emit_started {
+                        on_event(SessionEvent::RecordingStarted);
+                    }
+                }
+                Err(e) => {
+                    self.auto_record = false;
+                    on_event(SessionEvent::RecordingFailed(format!("recording thread: {e}")));
+                }
+            },
+            Err(e) => {
+                self.auto_record = false;
+                on_event(SessionEvent::RecordingFailed(format!("clips folder: {e}")));
+            }
+        }
+    }
+
+    fn rotate_segment(
+        &mut self,
+        recorder: &mut Option<Recorder>,
+        rec_workers: &mut RecWorkers,
+        opts: &SessionOptions,
+        streams: &[MuxStream],
+        stats: &VideoStats,
+        on_event: &dyn Fn(SessionEvent),
+    ) {
+        self.split_pending = false;
+        self.accumulate_and_stop(recorder, rec_workers, true);
+        self.start_segment(recorder, rec_workers, opts, streams, stats, false, on_event);
+    }
+}
+
+fn apply_pause(
+    recorder: &mut Option<Recorder>,
+    rec_workers: &mut RecWorkers,
+    paused: bool,
+    on_event: &dyn Fn(SessionEvent),
+) {
+    if let Some(rec) = recorder.as_mut()
+        && rec.paused != paused
+    {
+        rec.paused = paused;
+        send_record_msg(recorder, rec_workers, RecMsg::SetPaused(paused), false);
+        on_event(SessionEvent::RecordingPaused(paused));
+    }
+}
+
 fn run_session(
     opts: &SessionOptions,
     rx: &crossbeam_channel::Receiver<SessionCmd>,
@@ -1352,6 +1750,7 @@ fn run_session(
     let mut rec_workers: RecWorkers = Vec::new();
     let mut shots: Shots = Vec::new();
     let mut recorder: Option<Recorder> = None;
+    let mut run = ContinuousRun::new(opts);
     let mut packets = Vec::new();
     let mut video = Some(v);
     let result = 'session: loop {
@@ -1363,56 +1762,153 @@ fn run_session(
                 Ok(i) => i,
                 Err(e) => break e,
             };
-            for p in packets.drain(..) {
-                if recorder.is_some() {
-                    send_record_packet(&mut recorder, &mut rec_workers, p.clone());
+            if run.is_continuous && run.auto_record {
+                let ready = source_ready_for_continuous(
+                    &opts.video.source,
+                    run.continuous.wait_for_source,
+                    v.stats.capture_kind,
+                );
+                if !ready {
+                    run.waiting_for_source = true;
+                    if recorder.is_some() {
+                        run.accumulate_and_stop(&mut recorder, &mut rec_workers, true);
+                        run.manual_paused = false;
+                        run.idle_paused = false;
+                    }
+                } else {
+                    run.waiting_for_source = false;
+                    if recorder.is_none() {
+                        run.start_segment(
+                            &mut recorder,
+                            &mut rec_workers,
+                            opts,
+                            &streams,
+                            &v.stats,
+                            true,
+                            on_event,
+                        );
+                    }
                 }
-                buf.push(p);
+            }
+            for p in packets.drain(..) {
+                if recorder.is_some() && !run.effective_paused() {
+                    if run.is_continuous
+                        && !run.split_pending
+                        && let Some(rec) = recorder.as_ref().filter(|r| r.packets() > 0)
+                    {
+                        let hit_mins = run.continuous.segment_mins > 0
+                            && rec.active_us() >= i64::from(run.continuous.segment_mins) * 60 * 1_000_000;
+                        let hit_mb =
+                            run.continuous.segment_mb > 0 && rec.bytes() >= u64::from(run.continuous.segment_mb) << 20;
+                        if hit_mins || hit_mb {
+                            run.split_pending = true;
+                        }
+                    }
+                    if run.split_pending && p.stream == VIDEO_STREAM && p.key {
+                        run.rotate_segment(&mut recorder, &mut rec_workers, opts, &streams, &v.stats, on_event);
+                    }
+                }
+                if run.keep_buffer() {
+                    if recorder.is_some() {
+                        send_record_packet(&mut recorder, &mut rec_workers, p.clone());
+                    }
+                    buf.push(p);
+                } else if recorder.is_some() {
+                    send_record_packet(&mut recorder, &mut rec_workers, p);
+                }
             }
             if let Err(e) = drain_audio(audio.as_ref(), |p| {
-                if recorder.is_some() {
-                    send_record_packet(&mut recorder, &mut rec_workers, p.clone());
+                if run.keep_buffer() {
+                    if recorder.is_some() {
+                        send_record_packet(&mut recorder, &mut rec_workers, p.clone());
+                    }
+                    buf.push(p);
+                } else if recorder.is_some() {
+                    send_record_packet(&mut recorder, &mut rec_workers, p);
                 }
-                buf.push(p);
                 Ok(())
             }) {
                 break 'session Err(e);
             }
             match rx.try_recv() {
                 Ok(SessionCmd::Save(secs)) => {
-                    let secs = secs.unwrap_or(opts.buffer_secs).min(opts.buffer_secs);
-                    let snapshot = buf.snapshot(secs);
-                    if snapshot.is_empty() {
-                        on_event(SessionEvent::SaveFailed("the replay buffer is still empty".into()));
+                    if !run.keep_buffer() {
+                        on_event(SessionEvent::SaveFailed(
+                            "the replay buffer is disabled while continuous mode is active".into(),
+                        ));
                     } else {
-                        match clip_path(&opts.clips_dir, opts.container.ext()) {
-                            Ok(path) => workers.push(mux::spawn_save(path, streams.clone(), snapshot)),
-                            Err(e) => on_event(SessionEvent::SaveFailed(format!("clips folder: {e}"))),
+                        let secs = secs.unwrap_or(opts.buffer_secs).min(opts.buffer_secs);
+                        let snapshot = buf.snapshot(secs);
+                        if snapshot.is_empty() {
+                            on_event(SessionEvent::SaveFailed("the replay buffer is still empty".into()));
+                        } else {
+                            match clip_path(&opts.clips_dir, opts.container.ext()) {
+                                Ok(path) => workers.push(mux::spawn_save(path, streams.clone(), snapshot)),
+                                Err(e) => on_event(SessionEvent::SaveFailed(format!("clips folder: {e}"))),
+                            }
                         }
                     }
                 }
                 Ok(SessionCmd::RecordStart) => {
+                    run.auto_record = run.is_continuous;
+                    run.manual_paused = false;
+                    run.idle_paused = false;
+                    run.split_pending = false;
                     if recorder.is_none() {
-                        match clip_path(&opts.clips_dir, "mkv") {
-                            Ok(mkv_path) => {
-                                let mp4_path =
-                                    (opts.container == config::Container::Mp4).then(|| mkv_path.with_extension("mp4"));
-                                match spawn_recorder(mkv_path, mp4_path, streams.clone()) {
-                                    Ok(rec) => {
-                                        recorder = Some(rec);
-                                        on_event(SessionEvent::RecordingStarted);
-                                    }
-                                    Err(e) => {
-                                        on_event(SessionEvent::RecordingFailed(format!("recording thread: {e}")));
-                                    }
-                                }
-                            }
-                            Err(e) => on_event(SessionEvent::RecordingFailed(format!("clips folder: {e}"))),
+                        run.prior_active_us = 0;
+                        run.prior_bytes = 0;
+                        run.segment_index = 0;
+                        let ready = !run.is_continuous
+                            || source_ready_for_continuous(
+                                &opts.video.source,
+                                run.continuous.wait_for_source,
+                                v.stats.capture_kind,
+                            );
+                        if ready {
+                            run.waiting_for_source = false;
+                            run.start_segment(
+                                &mut recorder,
+                                &mut rec_workers,
+                                opts,
+                                &streams,
+                                &v.stats,
+                                true,
+                                on_event,
+                            );
+                        } else {
+                            run.waiting_for_source = true;
                         }
                     }
                 }
                 Ok(SessionCmd::RecordStop) => {
-                    stop_recorder(&mut recorder, &mut rec_workers, None);
+                    run.auto_record = false;
+                    run.manual_paused = false;
+                    run.idle_paused = false;
+                    run.waiting_for_source = false;
+                    run.accumulate_and_stop(&mut recorder, &mut rec_workers, false);
+                }
+                Ok(SessionCmd::RecordTogglePause) => {
+                    if recorder.is_some() {
+                        run.manual_paused = !run.manual_paused;
+                        if !run.manual_paused {
+                            run.idle_paused = false;
+                        }
+                        apply_pause(&mut recorder, &mut rec_workers, run.effective_paused(), on_event);
+                    }
+                }
+                Ok(SessionCmd::RecordSplit) => {
+                    if recorder.as_ref().is_some_and(|r| r.packets() > 0) && !run.effective_paused() {
+                        run.split_pending = true;
+                    }
+                }
+                Ok(SessionCmd::UpdateContinuous(new_c)) => {
+                    run.continuous = new_c;
+                    if !run.keep_buffer() {
+                        buf.flush();
+                    }
+                }
+                Ok(SessionCmd::Preview(max_w, reply)) => {
+                    let _ = reply.send(v.preview(max_w));
                 }
                 Ok(SessionCmd::Screenshot) => {
                     let started = clip_path(&opts.clips_dir, "png")
@@ -1436,18 +1932,83 @@ fn run_session(
             reap_recordings(&mut rec_workers, false, on_event);
             reap_shots(&mut shots, false, on_event);
             if index % fps == 0 {
-                let b = buf.stats();
+                if run.is_continuous {
+                    if run.continuous.split_on_app_change
+                        && !run.effective_paused()
+                        && let Some(rec) = recorder.as_ref()
+                        && rec.packets() > 0
+                        && current_app(&v.stats) != rec.app
+                    {
+                        run.split_pending = true;
+                    }
+                    if run.continuous.idle_pause_mins > 0 {
+                        let threshold_secs = run.continuous.idle_pause_mins * 60;
+                        if let Some(idle) = idle_seconds() {
+                            if !run.idle_paused && !run.manual_paused && idle >= threshold_secs && recorder.is_some() {
+                                run.idle_paused = true;
+                                apply_pause(&mut recorder, &mut rec_workers, run.effective_paused(), on_event);
+                            } else if run.idle_paused && idle < threshold_secs {
+                                run.idle_paused = false;
+                                apply_pause(&mut recorder, &mut rec_workers, run.effective_paused(), on_event);
+                            }
+                        }
+                    } else if run.idle_paused {
+                        run.idle_paused = false;
+                        apply_pause(&mut recorder, &mut rec_workers, run.effective_paused(), on_event);
+                    }
+                    if run.continuous.max_mins > 0 && recorder.is_some() {
+                        let total_active_us = run.prior_active_us + recorder.as_ref().map_or(0, |r| r.active_us());
+                        if total_active_us >= i64::from(run.continuous.max_mins) * 60 * 1_000_000 {
+                            run.auto_record = false;
+                            run.manual_paused = false;
+                            run.idle_paused = false;
+                            run.waiting_for_source = false;
+                            run.accumulate_and_stop(&mut recorder, &mut rec_workers, false);
+                            on_event(SessionEvent::RecordingStoppedReason(format!(
+                                "Reached the {} minute continuous limit; recording stopped and saved.",
+                                run.continuous.max_mins
+                            )));
+                        }
+                    }
+                    if (index / fps) % 5 == 0 && (recorder.is_some() || run.auto_record) {
+                        run.check_disk_space(&opts.clips_dir, &mut recorder, &mut rec_workers, on_event);
+                    }
+                }
+                let b = if run.keep_buffer() {
+                    buf.stats()
+                } else {
+                    crate::buffer::Stats {
+                        packets: 0,
+                        bytes: 0,
+                        span_us: 0,
+                    }
+                };
+                let seg_us = recorder.as_ref().map_or(0, |r| r.active_us());
+                let seg_bytes = recorder.as_ref().map_or(0, |r| r.bytes());
+                let total_active_us = if run.is_continuous {
+                    run.prior_active_us + seg_us
+                } else {
+                    seg_us
+                };
                 on_event(SessionEvent::Status(SessionStatus {
                     buffered_secs: b.span_us as f64 / 1e6,
                     buffered_bytes: b.bytes as u64,
                     frames: v.stats.frames,
                     dropped: v.stats.dropped,
-                    buffer_estimate_mb: estimate_mb,
+                    buffer_estimate_mb: if run.keep_buffer() { estimate_mb } else { 0 },
                     recording: recorder.is_some(),
-                    recording_secs: recorder.as_ref().map_or(0.0, |r| r.started_at.elapsed().as_secs_f64()),
+                    recording_paused: recorder.as_ref().is_some_and(|r| r.paused),
+                    waiting_for_source: run.is_continuous && run.auto_record && run.waiting_for_source,
+                    recording_secs: total_active_us as f64 / 1e6,
+                    segment_secs: seg_us as f64 / 1e6,
+                    segment_bytes: seg_bytes,
+                    session_bytes: run.prior_bytes + seg_bytes,
+                    segment_index: recorder.as_ref().map_or(0, |r| r.index),
                     capture_kind: v.stats.capture_kind,
                     capture_exe: v.stats.capture_exe.clone(),
                     capture_title: v.stats.capture_title.clone(),
+                    source_width: v.stats.source_width,
+                    source_height: v.stats.source_height,
                     source: v.stats.source.clone(),
                     notes: v.stats.notes.clone(),
                 }));
@@ -1458,7 +2019,7 @@ fn run_session(
         // change), back off between attempts. Audio keeps running; its packets are
         // dropped by the empty buffer until the first new keyframe.
         on_event(SessionEvent::Recovering(failure.to_string()));
-        stop_recorder(&mut recorder, &mut rec_workers, None);
+        run.accumulate_and_stop(&mut recorder, &mut rec_workers, run.is_continuous);
         video = None;
         buf.flush();
         let mut attempt = 0;
@@ -1474,10 +2035,24 @@ fn run_session(
                     Ok(SessionCmd::Save(_)) => on_event(SessionEvent::SaveFailed(
                         "capture is restarting; nothing to save yet".into(),
                     )),
-                    Ok(SessionCmd::RecordStart) => on_event(SessionEvent::RecordingFailed(
-                        "capture is restarting; cannot start recording yet".into(),
-                    )),
-                    Ok(SessionCmd::RecordStop) => {}
+                    Ok(SessionCmd::RecordStart) => {
+                        if run.is_continuous {
+                            run.auto_record = true;
+                        } else {
+                            on_event(SessionEvent::RecordingFailed(
+                                "capture is restarting; cannot start recording yet".into(),
+                            ));
+                        }
+                    }
+                    Ok(SessionCmd::RecordStop) => {
+                        run.auto_record = false;
+                        run.waiting_for_source = false;
+                    }
+                    Ok(SessionCmd::RecordTogglePause | SessionCmd::RecordSplit) => {}
+                    Ok(SessionCmd::UpdateContinuous(new_c)) => run.continuous = new_c,
+                    Ok(SessionCmd::Preview(_, reply)) => {
+                        let _ = reply.send(Err("capture is restarting".into()));
+                    }
                     Ok(SessionCmd::Screenshot) => {
                         on_event(SessionEvent::ScreenshotFailed(
                             "capture is restarting; try again".into(),
@@ -1504,7 +2079,7 @@ fn run_session(
         video = Some(v);
     };
     // Saves and recordings already started still finish (they hold their own packet handles).
-    stop_recorder(&mut recorder, &mut rec_workers, None);
+    stop_recorder(&mut recorder, &mut rec_workers, None, false);
     reap(&mut workers, true, on_event);
     reap_recordings(&mut rec_workers, true, on_event);
     reap_shots(&mut shots, true, on_event);
@@ -1514,4 +2089,359 @@ fn run_session(
     finished?;
     stopped?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Video source preview (Settings dashboard).
+
+/// Snapshot and resolved specs of the active or drafted video source for the UI preview card.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VideoPreview {
+    /// PNG data URL (`data:image/png;base64,...`), or `None` when waiting with no fallback frame.
+    pub frame: Option<String>,
+    /// "display", "window", or "waiting".
+    pub kind: String,
+    pub exe: Option<String>,
+    pub title: Option<String>,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub fps: u32,
+    pub monitor_label: String,
+    /// True when `kind` is `"display"` only because the target app/game is not running yet.
+    pub fallback_active: bool,
+    pub note: Option<String>,
+}
+
+struct PreviewCapturer {
+    device: capture::SendDevice,
+    luid: (u32, i32),
+    target: Target,
+    display: Option<u32>,
+    cursor: bool,
+    src: WgcSource,
+    last: Option<(shot::Image, u32, u32)>,
+}
+
+static PREVIEW_CACHE: Mutex<Option<PreviewCapturer>> = Mutex::new(None);
+
+/// Drop any cached disarmed preview WGC capture session (called on arm/disarm/pause/window close).
+pub fn clear_preview_cache() {
+    if let Ok(mut g) = PREVIEW_CACHE.lock() {
+        *g = None;
+    }
+}
+
+fn resolve_preview_output(s: &config::Settings, mon_w: u32, mon_h: u32, refresh_hz: u32) -> (u32, u32, u32) {
+    let v = s.video();
+    let out_w = if v.width == 0 {
+        (mon_w.clamp(320, 7680)) & !1
+    } else {
+        v.width
+    };
+    let out_h = if v.height == 0 {
+        (mon_h.clamp(320, 7680)) & !1
+    } else {
+        v.height
+    };
+    let fps = if refresh_hz > 0 { v.fps.min(refresh_hz) } else { v.fps };
+    (out_w, out_h, fps)
+}
+
+/// Build a [`VideoPreview`] from the running capture session's newest frame.
+pub fn build_armed_preview(
+    img: &shot::Image,
+    stats: &VideoStats,
+    s: &config::Settings,
+) -> std::result::Result<VideoPreview, String> {
+    capture::com_init();
+    let v = s.video();
+    let (out_w, out_h, fps) = if v.width > 0 && v.height > 0 {
+        let hz = pick_output_or_primary(s.display)
+            .ok()
+            .map(|(_, o, _)| o.refresh_hz)
+            .unwrap_or(0);
+        resolve_preview_output(s, v.width, v.height, hz)
+    } else if let Ok((_, o, _)) = pick_output_or_primary(s.display) {
+        resolve_preview_output(s, o.width.max(1) as u32, o.height.max(1) as u32, o.refresh_hz)
+    } else {
+        (stats.width, stats.height, v.fps.min(stats.fps.max(1)))
+    };
+    let frame = Some(shot::encode_png_data_url(img).map_err(|e| e.to_string())?);
+    let source_width = if stats.source_width > 0 {
+        stats.source_width
+    } else {
+        stats.width
+    };
+    let source_height = if stats.source_height > 0 {
+        stats.source_height
+    } else {
+        stats.height
+    };
+    let fallback_active = s.source.kind != config::SourceKind::Display && stats.capture_kind == "display";
+    Ok(VideoPreview {
+        frame,
+        kind: stats.capture_kind.to_owned(),
+        exe: stats.capture_exe.clone(),
+        title: stats.capture_title.clone(),
+        source_width,
+        source_height,
+        output_width: out_w,
+        output_height: out_h,
+        fps,
+        monitor_label: stats.source.clone(),
+        fallback_active,
+        note: None,
+    })
+}
+
+fn read_preview_frame(
+    device: &ID3D11Device,
+    frame: &capture::Frame,
+    max_w: u32,
+) -> std::result::Result<(shot::Image, u32, u32), String> {
+    // SAFETY: device is live; immediate context is used only on the calling thread under Mutex.
+    let ctx = unsafe { device.GetImmediateContext() }.map_err(|e| e.to_string())?;
+    shot::read_bgra_scaled(device, &ctx, &frame.tex, frame.width, frame.height, max_w).map_err(|e| e.to_string())
+}
+
+fn open_preview_capturer(
+    adapter: &Adapter,
+    output: &Output,
+    active: &mut Target,
+    display: Option<u32>,
+    cursor: bool,
+    max_w: u32,
+    note: &mut Option<String>,
+) -> std::result::Result<PreviewCapturer, String> {
+    let (device, _ctx) = capture::create_device(adapter).map_err(|e| e.to_string())?;
+    let mut src = match active {
+        Target::Window { hwnd, exe, .. } => match WgcSource::for_window(&device, *hwnd, cursor) {
+            Ok(s) => s,
+            Err(e) => {
+                *note = Some(format!("Could not capture {exe} ({e}); showing display instead."));
+                *active = Target::Display;
+                WgcSource::for_monitor(&device, output, cursor).map_err(|e| e.to_string())?
+            }
+        },
+        _ => WgcSource::for_monitor(&device, output, cursor).map_err(|e| e.to_string())?,
+    };
+    let last = match wait_first_frame(&mut src, Duration::from_millis(350)) {
+        Ok(f) => read_preview_frame(&device, &f, max_w).ok(),
+        Err(_) => None,
+    };
+    Ok(PreviewCapturer {
+        device: capture::SendDevice(device),
+        luid: adapter.luid,
+        target: active.clone(),
+        display,
+        cursor,
+        src,
+        last,
+    })
+}
+
+/// Capture a lightweight preview frame matching draft settings without starting encoders or audio.
+pub fn preview_source(s: &config::Settings, max_w: u32) -> std::result::Result<VideoPreview, String> {
+    capture::com_init();
+    let found = (s.source.kind == config::SourceKind::Auto).then(game::detect).flatten();
+    let prev_target = PREVIEW_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.target.clone()));
+    let mut active = resolve(&s.source, prev_target.as_ref(), found);
+
+    let (adapter, output, fell_back) = match &active {
+        Target::Window { hwnd, .. } => pick_output_for_window(*hwnd, s.display).map_err(|e| e.to_string())?,
+        _ => pick_output_or_primary(s.display).map_err(|e| e.to_string())?,
+    };
+    let (out_w, out_h, fps) = resolve_preview_output(
+        s,
+        output.width.max(1) as u32,
+        output.height.max(1) as u32,
+        output.refresh_hz,
+    );
+    let monitor_label = format!("{}x{} @ {} Hz", output.width, output.height, output.refresh_hz);
+    let mut note = fell_back.then(|| {
+        format!(
+            "Display {} was not found; previewing the main monitor.",
+            s.display.unwrap_or(0)
+        )
+    });
+
+    if active == Target::Waiting {
+        clear_preview_cache();
+        return Ok(VideoPreview {
+            frame: None,
+            kind: "waiting".into(),
+            exe: (!s.source.exe.is_empty()).then(|| s.source.exe.clone()),
+            title: (!s.source.title.is_empty()).then(|| s.source.title.clone()),
+            source_width: 0,
+            source_height: 0,
+            output_width: out_w,
+            output_height: out_h,
+            fps,
+            monitor_label,
+            fallback_active: false,
+            note,
+        });
+    }
+
+    let mut guard = PREVIEW_CACHE.lock().map_err(|_| "preview lock poisoned".to_string())?;
+    let reuse = guard.as_ref().is_some_and(|c| {
+        c.luid == adapter.luid && c.target == active && c.display == s.display && c.cursor == s.cursor
+    });
+    if !reuse {
+        *guard = None;
+    }
+
+    let mut cached_snapshot: Option<(shot::Image, u32, u32)> = None;
+    if let Some(cap) = guard.as_mut() {
+        match cap.src.next_frame(0) {
+            Ok(Some(f)) => match read_preview_frame(&cap.device.0, &f, max_w) {
+                Ok(img) => {
+                    cap.last = Some(img.clone());
+                    cached_snapshot = Some(img);
+                }
+                Err(_) => cached_snapshot = cap.last.clone(),
+            },
+            Ok(None) => cached_snapshot = cap.last.clone(),
+            Err(_) => {
+                *guard = None;
+            }
+        }
+    }
+
+    if guard.is_none() {
+        let cap = open_preview_capturer(&adapter, &output, &mut active, s.display, s.cursor, max_w, &mut note)?;
+        cached_snapshot = cap.last.clone();
+        *guard = Some(cap);
+    }
+    drop(guard);
+
+    let frame = cached_snapshot
+        .as_ref()
+        .map(|(img, _, _)| shot::encode_png_data_url(img))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let (source_width, source_height) = cached_snapshot.as_ref().map_or((0, 0), |(_, w, h)| (*w, *h));
+    let (kind, exe, title) = match &active {
+        Target::Window { exe, title, .. } => ("window".to_owned(), Some(exe.clone()), Some(title.clone())),
+        Target::Waiting => (
+            "waiting".to_owned(),
+            (!s.source.exe.is_empty()).then(|| s.source.exe.clone()),
+            None,
+        ),
+        Target::Display => ("display".to_owned(), None, None),
+    };
+    let fallback_active = s.source.kind != config::SourceKind::Display && matches!(active, Target::Display);
+
+    Ok(VideoPreview {
+        frame,
+        kind,
+        exe,
+        title,
+        source_width,
+        source_height,
+        output_width: out_w,
+        output_height: out_h,
+        fps,
+        monitor_label,
+        fallback_active,
+        note,
+    })
+}
+
+#[cfg(test)]
+mod continuous_tests {
+    use super::*;
+
+    #[test]
+    fn source_readiness_respects_wait_and_source_kind() {
+        let app_no_fb = config::SourceSettings {
+            kind: config::SourceKind::App,
+            exe: "game.exe".into(),
+            title: String::new(),
+            fallback: false,
+        };
+        assert!(!source_ready_for_continuous(&app_no_fb, true, "waiting"));
+        assert!(source_ready_for_continuous(&app_no_fb, true, "window"));
+        assert!(source_ready_for_continuous(&app_no_fb, false, "waiting"));
+
+        let auto = config::SourceSettings {
+            kind: config::SourceKind::Auto,
+            ..Default::default()
+        };
+        assert!(!source_ready_for_continuous(&auto, true, "display"));
+        assert!(source_ready_for_continuous(&auto, true, "window"));
+        assert!(source_ready_for_continuous(&auto, false, "display"));
+
+        let display = config::SourceSettings::default();
+        assert!(source_ready_for_continuous(&display, true, "display"));
+    }
+
+    #[test]
+    fn segment_clip_path_avoids_mp4_and_tmp_collisions() {
+        let dir = std::env::temp_dir().join(format!("suicap_seg_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mkv1, mp41) = segment_clip_path(&dir, "Game", Some(1), config::Container::Mp4).unwrap();
+        let mp41 = mp41.unwrap();
+        assert_eq!(mkv1.extension().unwrap(), "mkv");
+        assert_eq!(mp41.extension().unwrap(), "mp4");
+        std::fs::write(&mp41, b"done").unwrap();
+        let (mkv2, mp42) = segment_clip_path(&dir, "Game", Some(1), config::Container::Mp4).unwrap();
+        assert_ne!(mkv1, mkv2);
+        assert_ne!(Some(&mp41), mp42.as_ref());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_preview_output_handles_high_and_refresh_clamp() {
+        let mut s = config::Settings {
+            preset: config::PresetName::High,
+            ..Default::default()
+        };
+        assert_eq!(resolve_preview_output(&s, 2560, 1440, 144), (2560, 1440, 60));
+
+        s.preset = config::PresetName::Custom;
+        s.custom.width = 1920;
+        s.custom.height = 1080;
+        s.custom.fps = 240;
+        assert_eq!(resolve_preview_output(&s, 2560, 1440, 144), (1920, 1080, 144));
+    }
+
+    #[test]
+    fn build_armed_preview_marks_fallback_when_targeting_app_on_display() {
+        let mut s = config::Settings {
+            preset: config::PresetName::Custom,
+            ..Default::default()
+        };
+        s.source.kind = config::SourceKind::App;
+        s.source.exe = "game.exe".into();
+        s.custom.width = 1280;
+        s.custom.height = 720;
+        s.custom.fps = 60;
+        let stats = VideoStats {
+            width: 1280,
+            height: 720,
+            source_width: 2560,
+            source_height: 1440,
+            fps: 60,
+            capture_kind: "display",
+            source: "WGC DISPLAY1".into(),
+            ..Default::default()
+        };
+        let img = shot::Image {
+            width: 4,
+            height: 2,
+            rgb: vec![128; 24],
+        };
+        let pv = build_armed_preview(&img, &stats, &s).unwrap();
+        assert!(pv.frame.as_deref().unwrap().starts_with("data:image/png;base64,"));
+        assert!(pv.fallback_active);
+        assert_eq!(pv.source_width, 2560);
+        assert_eq!(pv.output_width, 1280);
+        assert_eq!(pv.output_height, 720);
+    }
 }

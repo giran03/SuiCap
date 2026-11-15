@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.1.2 (in development)
+## 0.1.2 (2026-11-15)
+
+### Added
+- **Continuous recording mode** alongside Replay on the dashboard, saving directly to disk until stopped. Includes automatic gapless segment splitting by time (5 to 240 minutes) or file size (500 MB to 10 GB), maximum session length, pause and resume (manual or automatic while idle), manual segment splitting, waiting for the chosen game or application before recording, automatic split when switching applications, minimum free disk space protection, and an option to keep the replay buffer active at the same time.
+- **Live video preview** above the Video panel showing how the selected source (Display, Application, or Auto) will frame inside the chosen output resolution, including letterboxing, fallback status, an optional corner badge overlay preview, and live/refresh controls.
+- **Storage tab in Settings** to select, open, or reset both the **Clips folder** and the **Temp folder** (used for in-progress recordings and MP4 remuxing), choose `MP4` or `MKV`, and adjust the library storage limit and minimum free disk space reserve.
+- **Continuous recording shortcuts and tray controls** to start or stop recording (default `Ctrl+Alt+F6`), pause or resume, and split segments from the tray menu or dashboard.
+- **Recording badge lifecycle flashes** showing distinct icons and messages when a recording starts, pauses, resumes, splits into a new segment, finishes saving, or stops due to a limit.
+- **Color-coded format tags** (`MP4`, `MKV`, `PNG`) on clip and screenshot cards in the Clips library.
+
+### Fixed
+- Interrupted or orphaned temporary recording files left behind by a crash or forced shutdown are now cleaned up automatically when SuiCap launches.
 
 ## 0.1.1 (2026-11-15)
 

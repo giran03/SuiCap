@@ -88,6 +88,42 @@ pub fn list(root: &Path) -> Vec<ClipEntry> {
     out
 }
 
+fn is_temp_clip(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !ext.eq_ignore_ascii_case("tmp") {
+        return false;
+    }
+    path.file_stem().map(Path::new).and_then(kind_of).is_some()
+}
+
+fn sweep_temp_dir(dir: &Path, recurse: bool) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut removed = 0;
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue; // links could point out of the clips folder
+        }
+        let path = e.path();
+        if ft.is_dir() {
+            if recurse {
+                removed += sweep_temp_dir(&path, false);
+            }
+        } else if ft.is_file() && is_temp_clip(&path) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Remove orphaned `<clip>.<ext>.tmp` files left in `root` (and its per-app folders) after a crash or force close.
+/// Call on startup before capture starts so active saves are never touched.
+pub fn cleanup_temp_files(root: &Path) -> usize {
+    sweep_temp_dir(root, true)
+}
+
 /// The canonical path of a library file, or why it is refused. The file must exist, sit
 /// inside `root` once links are resolved, and be a clip or screenshot type.
 pub fn resolve(root: &Path, path: &Path) -> Result<PathBuf, String> {
@@ -549,6 +585,28 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn cleanup_temp_files_removes_only_orphaned_clip_tmps() {
+        let d = temp("cleanup-tmp");
+        file(&d.join("Game/keep.mp4"), 10, 100);
+        file(&d.join("Game/orphan.mp4.tmp"), 10, 100);
+        file(&d.join("Game/orphan.mkv.tmp"), 10, 100);
+        file(&d.join("Game/orphan.png.tmp"), 10, 100);
+        file(&d.join("Game/unrelated.txt.tmp"), 10, 100);
+        file(&d.join("top.mp4.tmp"), 10, 100);
+        file(&d.join("notes.tmp"), 10, 100);
+
+        assert_eq!(cleanup_temp_files(&d), 4);
+        assert!(d.join("Game/keep.mp4").exists());
+        assert!(!d.join("Game/orphan.mp4.tmp").exists());
+        assert!(!d.join("Game/orphan.mkv.tmp").exists());
+        assert!(!d.join("Game/orphan.png.tmp").exists());
+        assert!(d.join("Game/unrelated.txt.tmp").exists());
+        assert!(!d.join("top.mp4.tmp").exists());
+        assert!(d.join("notes.tmp").exists());
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// Manual check against real clips: `SUICAP_CLIPS=<dir> cargo test -p suicap-core thumbs -- --ignored --nocapture`.

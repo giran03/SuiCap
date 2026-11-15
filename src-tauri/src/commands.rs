@@ -57,6 +57,16 @@ pub fn record_stop(state: State<'_, AppState>) -> CmdResult<()> {
 }
 
 #[tauri::command]
+pub fn record_pause(state: State<'_, AppState>) -> CmdResult<()> {
+    state.record_pause()
+}
+
+#[tauri::command]
+pub fn record_split(state: State<'_, AppState>) -> CmdResult<()> {
+    state.record_split()
+}
+
+#[tauri::command]
 pub fn config_get(state: State<'_, AppState>) -> Settings {
     state.settings()
 }
@@ -65,6 +75,12 @@ pub fn config_get(state: State<'_, AppState>) -> Settings {
 #[tauri::command]
 pub fn default_clips_dir(state: State<'_, AppState>) -> String {
     state.default_clips_dir.to_string_lossy().into_owned()
+}
+
+/// Folder temporary recording files go to when none is chosen.
+#[tauri::command]
+pub fn default_temp_dir(state: State<'_, AppState>) -> String {
+    state.default_temp_dir.to_string_lossy().into_owned()
 }
 
 /// Settings fields that change what is captured; editing any restarts capture. The on/off
@@ -86,15 +102,15 @@ fn capture_key(s: &Settings, live: &AudioLive) -> String {
     audio.media.clear();
     audio.ignored.clear();
     format!(
-        "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
-        v, audio, s.buffer_secs, s.container, s.clips_dir, s.display, s.cursor
+        "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+        v, audio, s.buffer_secs, s.container, s.clips_dir, s.display, s.cursor, s.mode, s.continuous.keep_replay_buffer
     )
 }
 
 #[tauri::command]
 pub fn config_set(app: AppHandle, settings: Settings) -> CmdResult<Status> {
     settings.validate().map_err(|e| e.to_string())?;
-    for (_, key) in settings.hotkeys.bindings() {
+    for key in settings.hotkeys.all() {
         if !key.is_empty() {
             Shortcut::from_str(key).map_err(|e| format!("shortcut \"{key}\": {e}"))?;
         }
@@ -103,6 +119,7 @@ pub fn config_set(app: AppHandle, settings: Settings) -> CmdResult<Status> {
     let old = state.settings();
     settings.save(&state.settings_path).map_err(|e| e.to_string())?;
     state.set_settings(settings.clone());
+    suicap_core::mux::set_temp_dir(Some(state.temp_dir()));
 
     if old.hotkeys != settings.hotkeys {
         crate::register_hotkeys(&app);
@@ -110,8 +127,11 @@ pub fn config_set(app: AppHandle, settings: Settings) -> CmdResult<Status> {
     if old.autostart != settings.autostart {
         apply_autostart(&app, settings.autostart);
     }
-    if old.buffer_secs != settings.buffer_secs {
-        state.update_status(&app, |st| st.buffer_secs = settings.buffer_secs);
+    if old.buffer_secs != settings.buffer_secs || old.mode != settings.mode {
+        state.update_status(&app, |st| {
+            st.buffer_secs = settings.buffer_secs;
+            st.mode = settings.mode;
+        });
     }
     let _ = tauri::Emitter::emit(&app, "settings", &settings);
     crate::badge::sync(&app);
@@ -126,6 +146,8 @@ pub fn config_set(app: AppHandle, settings: Settings) -> CmdResult<Status> {
             st.disarm(&app);
             st.arm(&app);
         });
+    } else if old.continuous != settings.continuous && state.is_armed() {
+        state.update_continuous(settings.continuous.clone());
     }
     Ok(state.status())
 }
@@ -177,6 +199,9 @@ pub fn displays() -> Vec<Display> {
 /// preset uses the monitor size.
 #[tauri::command]
 pub fn estimate_mb(settings: Settings) -> u64 {
+    if settings.mode == suicap_core::config::RecordingMode::Continuous && !settings.continuous.keep_replay_buffer {
+        return 0;
+    }
     let v = settings.video();
     let mut preset = VideoOptions::from_settings(&settings).preset;
     if preset.width == 0 {
@@ -196,6 +221,43 @@ pub fn open_clips_dir(state: &AppState) -> CmdResult<()> {
 #[tauri::command]
 pub fn open_clips_folder(state: State<'_, AppState>) -> CmdResult<()> {
     open_clips_dir(&state)
+}
+
+pub fn open_temp_dir(state: &AppState) -> CmdResult<()> {
+    let dir = state.temp_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    explorer(&[dir.into_os_string()])
+}
+
+#[tauri::command]
+pub fn open_temp_folder(state: State<'_, AppState>) -> CmdResult<()> {
+    open_temp_dir(&state)
+}
+
+#[tauri::command]
+pub fn close_video_preview() {
+    suicap_core::pipeline::clear_preview_cache();
+}
+
+/// Preview frame and resolved dimensions for the active or drafted video source.
+#[tauri::command]
+pub async fn video_preview(app: AppHandle, settings: Settings) -> CmdResult<suicap_core::pipeline::VideoPreview> {
+    let state = app.state::<AppState>();
+    let saved = state.settings();
+    let source_matches_live = state.is_armed()
+        && saved.source == settings.source
+        && saved.display == settings.display
+        && saved.cursor == settings.cursor;
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        if source_matches_live && let Some(Ok((img, stats))) = st.session_preview(640) {
+            suicap_core::pipeline::clear_preview_cache();
+            return suicap_core::pipeline::build_armed_preview(&img, &stats, &settings);
+        }
+        suicap_core::pipeline::preview_source(&settings, 640)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---- Clip library (plan §6.3). Every path is re-resolved inside the clips folder by
@@ -294,9 +356,21 @@ fn explorer(args: &[std::ffi::OsString]) -> CmdResult<()> {
 /// Ask for a clips folder; `None` if cancelled.
 #[tauri::command]
 pub async fn pick_clips_dir(app: AppHandle) -> CmdResult<Option<String>> {
-    let start = app.state::<AppState>().clips_dir();
-    let picked = app.dialog().file().set_directory(start).blocking_pick_folder();
-    match picked {
+    pick_dir_starting_at(&app, app.state::<AppState>().clips_dir())
+}
+
+/// Ask for a temp folder; `None` if cancelled.
+#[tauri::command]
+pub async fn pick_temp_dir(app: AppHandle) -> CmdResult<Option<String>> {
+    pick_dir_starting_at(&app, app.state::<AppState>().temp_dir())
+}
+
+fn pick_dir_starting_at(app: &AppHandle, start: PathBuf) -> CmdResult<Option<String>> {
+    let mut dialog = app.dialog().file();
+    if start.exists() {
+        dialog = dialog.set_directory(start);
+    }
+    match dialog.blocking_pick_folder() {
         None => Ok(None),
         Some(p) => p
             .into_path()

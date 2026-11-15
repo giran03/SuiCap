@@ -167,8 +167,16 @@ fn read_known_games() -> HashSet<String> {
         for i in 0..4096u32 {
             let mut name = [0u16; 256];
             let mut len = name.len() as u32;
-            if RegEnumKeyExW(root, i, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None)
-                != ERROR_SUCCESS
+            if RegEnumKeyExW(
+                root,
+                i,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut len,
+                None,
+                None,
+                None,
+                None,
+            ) != ERROR_SUCCESS
             {
                 break;
             }
@@ -218,8 +226,13 @@ fn visible_bounds(hwnd: HWND) -> Option<RECT> {
     let mut r = RECT::default();
     // SAFETY: plain queries with a sized local.
     unsafe {
-        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, (&raw mut r).cast(), size_of::<RECT>() as u32)
-            .is_ok()
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&raw mut r).cast(),
+            size_of::<RECT>() as u32,
+        )
+        .is_ok()
             && area(&r) > 0
         {
             return Some(r);
@@ -282,7 +295,9 @@ pub fn detect() -> Option<Game> {
     };
     let front_is_ours = fg.is_invalid()
         || pid_of(fg) == me
-        || path_of(pid_of(fg)).and_then(|p| crate::audio::exe_name(&p)).is_none_or(|e| never_a_game(&e));
+        || path_of(pid_of(fg))
+            .and_then(|p| crate::audio::exe_name(&p))
+            .is_none_or(|e| never_a_game(&e));
 
     // Big windows already seen per monitor, in Z-order: what covers a lower window.
     let mut covered: Vec<HMONITOR> = Vec::new();
@@ -300,7 +315,9 @@ pub fn detect() -> Option<Game> {
             continue;
         }
         let Some(path) = path_of(pid) else { continue };
-        let Some(exe) = crate::audio::exe_name(&path) else { continue };
+        let Some(exe) = crate::audio::exe_name(&path) else {
+            continue;
+        };
         if never_a_game(&exe) {
             continue;
         }
@@ -314,7 +331,12 @@ pub fn detect() -> Option<Game> {
             if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
                 continue;
             }
-            (monitor, mi, GetWindowLongW(hwnd, GWL_STYLE) as u32, IsZoomed(hwnd).as_bool())
+            (
+                monitor,
+                mi,
+                GetWindowLongW(hwnd, GWL_STYLE) as u32,
+                IsZoomed(hwnd).as_bool(),
+            )
         };
         let facts = Facts {
             foreground: hwnd == fg,
@@ -449,8 +471,24 @@ mod tests {
             right: 1920,
             bottom: 1080,
         };
-        assert!(covers(&RECT { left: 1, top: 0, right: 1919, bottom: 1080 }, &m));
-        assert!(!covers(&RECT { left: 0, top: 0, right: 1920, bottom: 1040 }, &m));
+        assert!(covers(
+            &RECT {
+                left: 1,
+                top: 0,
+                right: 1919,
+                bottom: 1080
+            },
+            &m
+        ));
+        assert!(!covers(
+            &RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040
+            },
+            &m
+        ));
     }
 
     /// Smoke test on the real desktop and registry: nothing panics, SuiCap is never the game.

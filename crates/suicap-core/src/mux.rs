@@ -70,6 +70,36 @@ pub struct Muxer {
     tmp: PathBuf,
     path: PathBuf,
     pub packets: u64,
+    pub bytes: u64,
+}
+
+static TEMP_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Configure the directory used for `.tmp` files (`None` = next to the destination file).
+pub fn set_temp_dir(dir: Option<PathBuf>) {
+    *TEMP_DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
+/// Currently configured temp directory, if any.
+pub fn temp_dir() -> Option<PathBuf> {
+    TEMP_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Return the `.tmp` path for `dest`, placing it in [`temp_dir`] when configured.
+pub fn temp_path(dest: &Path) -> std::io::Result<PathBuf> {
+    if let Some(dir) = temp_dir() {
+        std::fs::create_dir_all(&dir)?;
+        let name = dest
+            .file_name()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing file name"))?;
+        let mut tmp_name = name.to_os_string();
+        tmp_name.push(".tmp");
+        Ok(dir.join(tmp_name))
+    } else {
+        let mut tmp = dest.as_os_str().to_owned();
+        tmp.push(".tmp");
+        Ok(PathBuf::from(tmp))
+    }
 }
 
 impl Muxer {
@@ -81,9 +111,7 @@ impl Muxer {
             Some("mp4") => c"mp4",
             _ => return Err(MuxError::Path(path.to_path_buf())),
         };
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
+        let tmp = temp_path(path)?;
         let ctmp = tmp
             .to_str()
             .and_then(|s| CString::new(s).ok())
@@ -106,6 +134,7 @@ impl Muxer {
                 tmp,
                 path: path.to_path_buf(),
                 packets: 0,
+                bytes: 0,
             };
             if pkt.is_null() {
                 return Err(MuxError::Ffmpeg {
@@ -203,7 +232,20 @@ impl Muxer {
             r?;
         }
         self.packets += 1;
+        self.bytes += p.data.len() as u64;
         Ok(())
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.rebase.set_paused(paused);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.rebase.is_paused()
+    }
+
+    pub fn active_duration_us(&self) -> i64 {
+        self.rebase.active_duration_us()
     }
 
     /// Write the trailer, close, and move the file to its final name.
@@ -249,21 +291,81 @@ impl Drop for Muxer {
     }
 }
 
-/// Shifts timestamps so the first video keyframe lands at 0 (plan §6.2). Packets before
-/// it (and audio older than it) are dropped, so the file starts decodable.
+/// Shifts timestamps so the first video keyframe lands at 0 (plan §6.2), and
+/// bridges pause/resume gaps on keyframes so timestamps remain continuous.
 #[derive(Debug, Default)]
 pub struct Rebaser {
     base_us: Option<i64>,
+    paused: bool,
+    wait_keyframe: bool,
+    pause_started_us: Option<i64>,
+    total_paused_us: i64,
+    resume_floor_us: Option<i64>,
+    last_pts_us: i64,
 }
 
 impl Rebaser {
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        self.paused = paused;
+        if paused && self.base_us.is_some() {
+            self.wait_keyframe = true;
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Output media duration written so far, excluding paused gaps.
+    pub fn active_duration_us(&self) -> i64 {
+        match self.base_us {
+            Some(base) => (self.last_pts_us - base - self.total_paused_us).max(0),
+            None => 0,
+        }
+    }
+
     /// Rebased `(pts, dts)` in microseconds, or `None` to skip the packet.
     pub fn apply(&mut self, p: &Packet) -> Option<(i64, i64)> {
-        if self.base_us.is_none() && p.stream == VIDEO_STREAM && p.key {
-            self.base_us = Some(p.pts_us);
+        if self.paused {
+            if self.base_us.is_some() && self.pause_started_us.is_none() && p.pts_us >= self.last_pts_us + 2_000 {
+                self.pause_started_us = Some(p.pts_us);
+            }
+            return None;
+        }
+        if self.base_us.is_none() {
+            if p.stream == VIDEO_STREAM && p.key {
+                self.base_us = Some(p.pts_us);
+                self.last_pts_us = p.pts_us;
+            } else {
+                return None;
+            }
+        }
+        if self.wait_keyframe {
+            if p.stream == VIDEO_STREAM && p.key {
+                let gap = match self.pause_started_us.take() {
+                    Some(start) => (p.pts_us - start).max(0),
+                    None => (p.pts_us - self.last_pts_us - 16_667).max(0),
+                };
+                // Keep resumed timestamps strictly after pre-pause packets across coarse container bases (1 ms MKV).
+                let max_gap = (p.pts_us - self.last_pts_us - 2_000).max(0);
+                self.total_paused_us += gap.min(max_gap);
+                self.resume_floor_us = Some(p.pts_us);
+                self.wait_keyframe = false;
+            } else {
+                return None;
+            }
         }
         let base = self.base_us?;
-        (p.pts_us >= base).then(|| (p.pts_us - base, p.dts_us() - base))
+        let floor = self.resume_floor_us.unwrap_or(base).max(base);
+        if p.pts_us < floor {
+            return None;
+        }
+        self.last_pts_us = self.last_pts_us.max(p.pts_us);
+        let offset = base + self.total_paused_us;
+        Some((p.pts_us - offset, p.dts_us() - offset))
     }
 }
 
@@ -324,9 +426,18 @@ pub fn safe_app_name(app: &str) -> String {
 
 /// `<App>_<YYYY-MM-DD_HH-mm-ss>.<ext>` with the app name made filesystem-safe (plan §6.2).
 pub fn clip_file_name(app: &str, t: [u16; 6], ext: &str) -> String {
+    segment_file_name(app, t, None, ext)
+}
+
+/// `<App>_<YYYY-MM-DD_HH-mm-ss>[_ptNN].<ext>`; keeps the `YYYY-MM-DD_HH-mm-ss`
+/// stamp so the clip library and quota rules recognize segmented recordings too.
+pub fn segment_file_name(app: &str, t: [u16; 6], part: Option<u32>, ext: &str) -> String {
     let safe = safe_app_name(app);
     let [y, mo, d, h, mi, s] = t;
-    format!("{safe}_{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}.{ext}")
+    match part {
+        Some(n) => format!("{safe}_{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}_pt{n:02}.{ext}"),
+        None => format!("{safe}_{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}.{ext}"),
+    }
 }
 
 /// Local wall-clock time as `[year, month, day, hour, minute, second]`.
@@ -443,9 +554,7 @@ pub fn remux_to_mp4(mkv: &Path, mp4: &Path) -> Result<()> {
         .to_str()
         .and_then(|s| CString::new(s).ok())
         .ok_or_else(|| MuxError::Path(mkv.to_path_buf()))?;
-    let mut tmp = mp4.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = temp_path(mp4)?;
     let ctmp = tmp
         .to_str()
         .and_then(|s| CString::new(s).ok())
@@ -628,9 +737,7 @@ pub fn trim(input: &Path, output: &Path, start_us: i64, end_us: i64) -> Result<T
             .ok_or_else(|| MuxError::Path(p.to_path_buf()))
     };
     let cin = path_c(input)?;
-    let mut tmp = output.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    let tmp = temp_path(output)?;
     let ctmp = path_c(&tmp)?;
     let is_mp4 = output.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"));
     let fmt_name: &std::ffi::CStr = if is_mp4 { c"mp4" } else { c"matroska" };
@@ -1046,6 +1153,47 @@ mod tests {
         assert!(!dir.join("out.mp4.tmp").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebaser_pause_resume_bridges_gap_cleanly() {
+        let pkt = |stream, key, pts_us| Packet::new(stream, key, pts_us, pts_us, bytes::Bytes::from_static(b"x"));
+        let mut r = Rebaser::default();
+        // Before first video keyframe: dropped.
+        assert_eq!(r.apply(&pkt(1, false, 900_000)), None);
+        assert_eq!(r.apply(&pkt(VIDEO_STREAM, true, 1_000_000)), Some((0, 0)));
+        assert_eq!(r.apply(&pkt(1, false, 1_010_000)), Some((10_000, 10_000)));
+        assert_eq!(r.apply(&pkt(VIDEO_STREAM, false, 1_016_666)), Some((16_666, 16_666)));
+
+        // Pause: packets during pause are skipped, including keyframes.
+        r.set_paused(true);
+        assert!(r.is_paused());
+        assert_eq!(r.apply(&pkt(VIDEO_STREAM, false, 1_033_333)), None);
+        assert_eq!(r.apply(&pkt(VIDEO_STREAM, true, 2_000_000)), None);
+
+        // Resume: waits for the next video keyframe and bridges the skipped duration.
+        r.set_paused(false);
+        assert!(!r.is_paused());
+        assert_eq!(r.apply(&pkt(VIDEO_STREAM, false, 5_483_333)), None);
+        assert_eq!(r.apply(&pkt(1, false, 5_490_000)), None);
+        let resumed = r.apply(&pkt(VIDEO_STREAM, true, 5_500_000)).unwrap();
+        assert_eq!(resumed, (33_333, 33_333));
+        assert!(r.active_duration_us() == 33_333);
+        // Stale packet from before resume keyframe is dropped; later audio follows cleanly.
+        assert_eq!(r.apply(&pkt(1, false, 5_495_000)), None);
+        assert_eq!(r.apply(&pkt(1, false, 5_510_000)), Some((43_333, 43_333)));
+    }
+
+    #[test]
+    fn segment_file_names_keep_timestamp_shape() {
+        assert_eq!(
+            segment_file_name("Game.exe", [2026, 11, 15, 16, 30, 5], None, "mp4"),
+            "Game.exe_2026-11-15_16-30-05.mp4"
+        );
+        assert_eq!(
+            segment_file_name("Game.exe", [2026, 11, 15, 16, 30, 5], Some(1), "mkv"),
+            "Game.exe_2026-11-15_16-30-05_pt01.mkv"
+        );
     }
 }
 

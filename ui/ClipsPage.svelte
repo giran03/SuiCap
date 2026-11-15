@@ -407,6 +407,7 @@
 <div class="grid" class:selecting={selectedItems.length > 0} bind:this={grid}>
   {#each shown as c (c.path)}
     {@const isSel = selected.has(c.path)}
+    {@const ext = c.name.split(".").pop()?.toLowerCase() ?? ""}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <article class="clip" class:selected={isSel} animate:flip={{ duration: 260, easing: cubicOut }} transition:fade={{ duration: 160 }} oncontextmenu={(e) => menu(e, c)}>
       <div class="thumb-wrap">
@@ -422,7 +423,7 @@
               {/if}
             </svg>
           {/if}
-          <span class="kind">{c.name.split(".").pop()}</span>
+          <span class="kind" data-ext={ext}>{ext}</span>
           {#if opening === c.path}
             <span class="opening-cue" transition:fade={{ duration: 140 }}><i class="spin"></i>Opening…</span>
           {/if}
@@ -733,12 +734,32 @@
     bottom: 8px;
     padding: 2px 7px;
     border-radius: 6px;
-    background: rgb(0 0 0 / 0.6);
+    background: rgb(0 0 0 / 0.68);
+    border: 1px solid rgb(255 255 255 / 0.16);
+    backdrop-filter: blur(6px);
     color: #fff;
     font-size: 10.5px;
     font-weight: 700;
     letter-spacing: 0.04em;
     text-transform: uppercase;
+  }
+  .kind[data-ext="mp4"] {
+    background: rgb(37 99 235 / 0.88);
+    border-color: rgb(147 197 253 / 0.45);
+  }
+  .kind[data-ext="mkv"] {
+    background: rgb(124 58 237 / 0.88);
+    border-color: rgb(196 181 253 / 0.45);
+  }
+  .kind[data-ext="png"] {
+    background: rgb(5 150 105 / 0.88);
+    border-color: rgb(110 231 183 / 0.45);
+  }
+  .kind[data-ext="jpg"],
+  .kind[data-ext="jpeg"],
+  .kind[data-ext="webp"] {
+    background: rgb(217 119 6 / 0.88);
+    border-color: rgb(252 211 77 / 0.45);
   }
   .meta {
     padding: 10px 12px 4px;

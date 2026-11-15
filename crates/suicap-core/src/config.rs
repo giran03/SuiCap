@@ -295,6 +295,10 @@ pub struct Hotkeys {
     pub screenshot: String,
     /// Switch between recording the app in front and the whole display.
     pub target_app: String,
+    /// Start/stop continuous recording (or toggle manual recording in replay mode).
+    pub record_toggle: String,
+    /// Pause/resume an active continuous recording.
+    pub record_pause: String,
 }
 
 impl Default for Hotkeys {
@@ -306,13 +310,15 @@ impl Default for Hotkeys {
             save_full: "Ctrl+Alt+F12".into(),
             screenshot: "Ctrl+Alt+F8".into(),
             target_app: "Ctrl+Alt+F7".into(),
+            record_toggle: "Ctrl+Alt+F6".into(),
+            record_pause: String::new(),
         }
     }
 }
 
 impl Hotkeys {
     /// Every accelerator, for validation.
-    pub fn all(&self) -> [&str; 6] {
+    pub fn all(&self) -> [&str; 8] {
         [
             &self.save_15,
             &self.save_30,
@@ -320,6 +326,8 @@ impl Hotkeys {
             &self.save_full,
             &self.screenshot,
             &self.target_app,
+            &self.record_toggle,
+            &self.record_pause,
         ]
     }
 
@@ -384,6 +392,64 @@ pub fn is_hex_color(c: &str) -> bool {
     c.len() == 7 && c.starts_with('#') && c[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 pub const BUFFER_SECS: std::ops::RangeInclusive<u32> = 10..=600;
+pub const SEGMENT_MINS_MAX: u32 = 240;
+pub const SEGMENT_MB_MIN: u32 = 100;
+pub const SEGMENT_MB_MAX: u32 = 100_000;
+pub const MAX_MINS_MIN: u32 = 5;
+pub const MAX_MINS_MAX: u32 = 1440;
+pub const IDLE_PAUSE_MINS_MAX: u32 = 240;
+pub const MIN_FREE_GB: std::ops::RangeInclusive<u32> = 1..=1000;
+
+/// How SuiCap records: an in-memory replay buffer or direct-to-disk continuous files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingMode {
+    /// Keep the last N seconds in RAM and save on demand.
+    #[default]
+    Replay,
+    /// Continuously write the selected video source to disk with optional auto-splits.
+    Continuous,
+}
+
+/// Customization options for continuous direct-to-disk recording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContinuousSettings {
+    /// Auto-cut into a new file every N minutes without stopping recording; 0 = single file.
+    pub segment_mins: u32,
+    /// Auto-cut into a new file once the current segment reaches N MB; 0 = no size limit.
+    pub segment_mb: u32,
+    /// Auto-stop continuous recording after N active minutes in one session; 0 = unlimited.
+    pub max_mins: u32,
+    /// In App (no display fallback) or Auto mode, wait without writing until the target window is active.
+    pub wait_for_source: bool,
+    /// Cut and start a new file under the new app folder when the captured application changes.
+    pub split_on_app_change: bool,
+    /// Auto-pause recording after N minutes without keyboard or mouse input; 0 = never.
+    pub idle_pause_mins: u32,
+    /// Stop cleanly before free space on the clips drive falls below N GB.
+    pub min_free_gb: u32,
+    /// Keep filling the in-memory replay buffer while recording continuously.
+    pub keep_replay_buffer: bool,
+    /// Play the save chime and show toast/flash on automatic segment splits.
+    pub notify_on_split: bool,
+}
+
+impl Default for ContinuousSettings {
+    fn default() -> Self {
+        Self {
+            segment_mins: 15,
+            segment_mb: 0,
+            max_mins: 0,
+            wait_for_source: true,
+            split_on_app_change: true,
+            idle_pause_mins: 0,
+            min_free_gb: 5,
+            keep_replay_buffer: false,
+            notify_on_split: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -391,10 +457,14 @@ pub struct Settings {
     pub preset: PresetName,
     /// Used when `preset` is `Custom`.
     pub custom: CustomVideo,
+    pub mode: RecordingMode,
+    pub continuous: ContinuousSettings,
     pub buffer_secs: u32,
     pub container: Container,
     /// `None` = the user's Videos folder + `SuiCap` (resolved by the shell).
     pub clips_dir: Option<PathBuf>,
+    /// `None` = `%LOCALAPPDATA%\SuiCap\Temp` (resolved by the shell).
+    pub temp_dir: Option<PathBuf>,
     pub cursor: bool,
     /// `\\.\DISPLAY<n>`; `None` = primary monitor.
     pub display: Option<u32>,
@@ -442,9 +512,12 @@ impl Default for Settings {
         Self {
             preset: PresetName::default(),
             custom: CustomVideo::default(),
+            mode: RecordingMode::default(),
+            continuous: ContinuousSettings::default(),
             buffer_secs: 120,
             container: Container::default(),
             clips_dir: None,
+            temp_dir: None,
             cursor: true,
             display: None,
             source: SourceSettings::default(),
@@ -539,15 +612,40 @@ impl Settings {
                 BUFFER_SECS.end()
             ));
         }
-        if let Some(d) = &self.clips_dir {
-            use std::path::{Component, Prefix};
-            let is_local_disk = matches!(
-                d.components().next(),
-                Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-            );
-            let has_parent = d.components().any(|c| matches!(c, Component::ParentDir));
-            if !d.is_absolute() || !is_local_disk || has_parent || d.as_os_str().len() > 200 {
-                return invalid("clips folder must be a local drive path under 200 characters");
+        if self.continuous.segment_mins > SEGMENT_MINS_MAX {
+            return invalid(format!("segment length is at most {SEGMENT_MINS_MAX} minutes"));
+        }
+        if self.continuous.segment_mb != 0 && !(SEGMENT_MB_MIN..=SEGMENT_MB_MAX).contains(&self.continuous.segment_mb) {
+            return invalid(format!(
+                "segment size limit must be 0 or {SEGMENT_MB_MIN} to {SEGMENT_MB_MAX} MB"
+            ));
+        }
+        if self.continuous.max_mins != 0 && !(MAX_MINS_MIN..=MAX_MINS_MAX).contains(&self.continuous.max_mins) {
+            return invalid(format!(
+                "maximum recording duration must be 0 or {MAX_MINS_MIN} to {MAX_MINS_MAX} minutes"
+            ));
+        }
+        if self.continuous.idle_pause_mins > IDLE_PAUSE_MINS_MAX {
+            return invalid(format!("idle auto-pause must be at most {IDLE_PAUSE_MINS_MAX} minutes"));
+        }
+        if !MIN_FREE_GB.contains(&self.continuous.min_free_gb) {
+            return invalid(format!(
+                "minimum free space must be {} to {} GB",
+                MIN_FREE_GB.start(),
+                MIN_FREE_GB.end()
+            ));
+        }
+        for (label, opt) in [("clips folder", &self.clips_dir), ("temp folder", &self.temp_dir)] {
+            if let Some(d) = opt {
+                use std::path::{Component, Prefix};
+                let is_local_disk = matches!(
+                    d.components().next(),
+                    Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+                );
+                let has_parent = d.components().any(|c| matches!(c, Component::ParentDir));
+                if !d.is_absolute() || !is_local_disk || has_parent || d.as_os_str().len() > 200 {
+                    return invalid(format!("{label} must be a local drive path under 200 characters"));
+                }
             }
         }
         if self.display.is_some_and(|n| !(1..=32).contains(&n)) {
@@ -725,6 +823,8 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"preset":"high","buffer_secs":60,"unknown":1}"#).unwrap();
         assert_eq!(s.preset, PresetName::High);
         assert_eq!(s.buffer_secs, 60);
+        assert_eq!(s.mode, RecordingMode::Replay);
+        assert_eq!(s.continuous, ContinuousSettings::default());
         assert_eq!(s.hotkeys, Hotkeys::default());
         assert_eq!(s.container, Container::Mkv);
         assert_eq!(s.video().width, 0);
@@ -738,6 +838,14 @@ mod tests {
             s.validate().is_err()
         };
         assert!(bad(|s| s.buffer_secs = 5));
+        assert!(bad(|s| s.continuous.segment_mins = 241));
+        assert!(bad(|s| s.continuous.segment_mb = 50));
+        assert!(bad(|s| s.continuous.segment_mb = 100_001));
+        assert!(bad(|s| s.continuous.max_mins = 4));
+        assert!(bad(|s| s.continuous.max_mins = 1441));
+        assert!(bad(|s| s.continuous.idle_pause_mins = 241));
+        assert!(bad(|s| s.continuous.min_free_gb = 0));
+        assert!(bad(|s| s.continuous.min_free_gb = 1001));
         assert!(bad(|s| s.custom.width = 1921));
         assert!(bad(|s| s.custom.fps = 500));
         assert!(bad(|s| s.custom.quality = 0));
@@ -775,7 +883,20 @@ mod tests {
         };
         ok.validate().unwrap();
         assert!(bad(|s| s.hotkeys.save_15 = "ctrl+alt+f10".into())); // duplicate of save_30
-        let mut s = Settings::default();
+        assert!(bad(|s| s.hotkeys.record_toggle = "ctrl+alt+f9".into())); // duplicate of save_15
+        assert!(bad(|s| s.hotkeys.record_pause = "ctrl+alt+f6".into())); // duplicate of record_toggle
+        let mut s = Settings {
+            mode: RecordingMode::Continuous,
+            continuous: ContinuousSettings {
+                segment_mins: 0,
+                segment_mb: 100,
+                max_mins: 5,
+                idle_pause_mins: 240,
+                min_free_gb: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         s.custom.width = 0;
         s.custom.height = 0;
         s.hotkeys.save_full.clear();

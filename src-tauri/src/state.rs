@@ -12,7 +12,7 @@ use std::{
 use serde::Serialize;
 use suicap_core::{
     audio::AudioOptions,
-    config::Settings,
+    config::{RecordingMode, Settings},
     encode::AudioCodec,
     mux::ClipInfo,
     pipeline::{Session, SessionEvent, SessionOptions, VideoOptions},
@@ -67,6 +67,7 @@ impl Default for CaptureTarget {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Status {
     pub phase: Phase,
+    pub mode: RecordingMode,
     pub encoder: String,
     pub resolution: String,
     pub source: String,
@@ -76,7 +77,13 @@ pub struct Status {
     pub buffered_mb: f64,
     pub buffer_estimate_mb: u64,
     pub recording: bool,
+    pub recording_paused: bool,
+    pub waiting_for_source: bool,
     pub recording_secs: f64,
+    pub segment_secs: f64,
+    pub segment_bytes: u64,
+    pub session_bytes: u64,
+    pub segment_index: u32,
     pub frames: u64,
     pub dropped: u64,
     pub error: Option<String>,
@@ -101,6 +108,7 @@ pub struct AppState {
     live: Mutex<Option<std::sync::Arc<suicap_core::audio::LiveTracks>>>,
     pub settings_path: PathBuf,
     pub default_clips_dir: PathBuf,
+    pub default_temp_dir: PathBuf,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -113,10 +121,12 @@ impl AppState {
         warning: Option<String>,
         settings_path: PathBuf,
         default_clips_dir: PathBuf,
+        default_temp_dir: PathBuf,
     ) -> Self {
         Self {
             status: Mutex::new(Status {
                 settings_warning: warning,
+                mode: settings.mode,
                 buffer_secs: settings.buffer_secs,
                 ..Default::default()
             }),
@@ -125,6 +135,7 @@ impl AppState {
             live: Mutex::new(None),
             settings_path,
             default_clips_dir,
+            default_temp_dir,
         }
     }
 
@@ -147,11 +158,25 @@ impl AppState {
         }
     }
 
+    /// Push updated continuous recording options into the running session live.
+    pub fn update_continuous(&self, continuous: suicap_core::config::ContinuousSettings) {
+        if let Some(s) = lock(&self.session).as_ref().filter(|s| s.is_running()) {
+            s.update_continuous(continuous);
+        }
+    }
+
     pub fn clips_dir(&self) -> PathBuf {
         lock(&self.settings)
             .clips_dir
             .clone()
             .unwrap_or_else(|| self.default_clips_dir.clone())
+    }
+
+    pub fn temp_dir(&self) -> PathBuf {
+        lock(&self.settings)
+            .temp_dir
+            .clone()
+            .unwrap_or_else(|| self.default_temp_dir.clone())
     }
 
     pub fn is_armed(&self) -> bool {
@@ -180,6 +205,7 @@ impl AppState {
             return;
         }
         drop(slot.take()); // a finished session: joins at once
+        suicap_core::pipeline::clear_preview_cache();
         let s = self.settings();
         let codec = AudioCodec::for_extension(s.container.ext());
         let audio = s.audio.enabled.then(|| {
@@ -202,6 +228,8 @@ impl AppState {
             AudioLive::default()
         };
         let opts = SessionOptions {
+            mode: s.mode,
+            continuous: s.continuous.clone(),
             buffer_secs: s.buffer_secs,
             video: VideoOptions::from_settings(&s),
             audio,
@@ -211,6 +239,7 @@ impl AppState {
         self.update_status(app, |st| {
             *st = Status {
                 phase: Phase::Starting,
+                mode: s.mode,
                 audio_live,
                 buffer_secs: s.buffer_secs,
                 last_clip: st.last_clip.take(),
@@ -235,6 +264,7 @@ impl AppState {
         if let Some(s) = session {
             s.stop();
         }
+        suicap_core::pipeline::clear_preview_cache();
         *lock(&self.live) = None;
         self.update_status(app, |st| {
             st.audio_live = AudioLive::default();
@@ -244,7 +274,13 @@ impl AppState {
             st.buffered_secs = 0.0;
             st.buffered_mb = 0.0;
             st.recording = false;
+            st.recording_paused = false;
+            st.waiting_for_source = false;
             st.recording_secs = 0.0;
+            st.segment_secs = 0.0;
+            st.segment_bytes = 0;
+            st.session_bytes = 0;
+            st.segment_index = 0;
         });
     }
 
@@ -288,8 +324,8 @@ impl AppState {
             Some(true) => Ok(()),
             Some(false) => Err("Recording could not be started right now; try again.".into()),
             None => {
-                feedback::notify(app, "Replay buffer is off", "Arm SuiCap from the tray to record.");
-                Err("Replay buffer is off".into())
+                feedback::notify(app, "Capture is off", "Arm SuiCap from the tray to record.");
+                Err("Capture is off".into())
             }
         }
     }
@@ -303,7 +339,62 @@ impl AppState {
         match queued {
             Some(true) => Ok(()),
             Some(false) => Err("Recording could not be stopped right now; try again.".into()),
-            None => Err("Replay buffer is off".into()),
+            None => Err("Capture is off".into()),
+        }
+    }
+
+    /// Start/stop recording (arming first in continuous mode if capture is off).
+    pub fn record_toggle(&self, app: &AppHandle) -> Result<(), String> {
+        if !self.is_armed() {
+            if self.settings().mode == RecordingMode::Continuous {
+                self.arm(app);
+                return Ok(());
+            }
+            feedback::notify(app, "Replay buffer is off", "Turn replay on before recording.");
+            return Err("Replay buffer is off".into());
+        }
+        let st = self.status();
+        if st.recording || st.waiting_for_source {
+            self.record_stop()
+        } else {
+            self.record_start(app)
+        }
+    }
+
+    /// Toggle pause on the active recording.
+    pub fn record_pause(&self) -> Result<(), String> {
+        let queued = lock(&self.session)
+            .as_ref()
+            .filter(|s| s.is_running())
+            .map(|s| s.record_toggle_pause());
+        match queued {
+            Some(true) => Ok(()),
+            Some(false) => Err("Recording pause could not be queued; try again.".into()),
+            None => Err("Capture is off".into()),
+        }
+    }
+
+    /// Fetch a scaled preview of the running session's newest frame, if armed.
+    pub fn session_preview(
+        &self,
+        max_w: u32,
+    ) -> Option<Result<(suicap_core::shot::Image, suicap_core::pipeline::VideoStats), String>> {
+        lock(&self.session)
+            .as_ref()
+            .filter(|s| s.is_running())
+            .map(|s| s.preview(max_w))
+    }
+
+    /// Cut the current continuous segment at the next keyframe and start a new file.
+    pub fn record_split(&self) -> Result<(), String> {
+        let queued = lock(&self.session)
+            .as_ref()
+            .filter(|s| s.is_running())
+            .map(|s| s.record_split());
+        match queued {
+            Some(true) => Ok(()),
+            Some(false) => Err("Segment split could not be queued; try again.".into()),
+            None => Err("Capture is off".into()),
         }
     }
 }
@@ -322,25 +413,83 @@ fn enforce_quota(app: &AppHandle, state: &AppState) {
     });
 }
 
-fn on_clip_saved(app: &AppHandle, state: &AppState, clip: ClipInfo, stop_recording: bool) {
+#[derive(Debug, Clone, Serialize)]
+pub struct BadgeFlash {
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub secs: Option<f64>,
+    pub tone: &'static str,
+    pub duration_ms: u32,
+}
+
+fn emit_badge_flash(app: &AppHandle, flash: BadgeFlash) {
+    crate::badge::hold_for_flash(app, std::time::Duration::from_millis(u64::from(flash.duration_ms)));
+    let _ = app.emit("badge_flash", &flash);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveKind {
+    ReplayClip,
+    SegmentSplit,
+    RecordingFinal,
+}
+
+fn on_clip_saved(app: &AppHandle, state: &AppState, clip: ClipInfo, kind: SaveKind) {
     let secs = (clip.last_pts_us - clip.first_pts_us).max(0) as f64 / 1e6;
     let name = clip
         .path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let settings = state.settings();
+    let announce = kind != SaveKind::SegmentSplit || settings.continuous.notify_on_split;
+    let announced = crate::badge::announces_clips(app);
+    let (flash_kind, flash_label) = match kind {
+        SaveKind::ReplayClip => ("clip_saved", "CLIP SAVED"),
+        SaveKind::SegmentSplit => ("segment_saved", "SEGMENT SAVED"),
+        SaveKind::RecordingFinal => ("recording_saved", "RECORDING SAVED"),
+    };
+    emit_badge_flash(
+        app,
+        BadgeFlash {
+            kind: flash_kind,
+            label: flash_label,
+            secs: Some(secs),
+            tone: "ok",
+            duration_ms: 3500,
+        },
+    );
     state.update_status(app, |st| {
-        if stop_recording {
-            st.recording = false;
-            st.recording_secs = 0.0;
+        if kind == SaveKind::RecordingFinal {
+            reset_recording_status(st);
         }
         st.last_clip = Some(clip.path.to_string_lossy().into_owned());
     });
     let _ = app.emit("clip_saved", clip.path.to_string_lossy());
-    let _ = app.emit("clip_flash", secs);
-    let announced = crate::badge::announces_clips(app);
-    feedback::clip_saved(app, &state.settings(), &name, secs, !announced);
+    if announce {
+        let _ = app.emit("clip_flash", secs);
+        match kind {
+            SaveKind::ReplayClip => feedback::clip_saved(app, &settings, &name, secs, !announced),
+            SaveKind::SegmentSplit => {
+                feedback::media_saved(app, &settings, "Segment saved", &name, secs, true, !announced)
+            }
+            SaveKind::RecordingFinal => {
+                feedback::media_saved(app, &settings, "Recording saved", &name, secs, true, !announced)
+            }
+        }
+    }
     enforce_quota(app, state);
+}
+
+fn reset_recording_status(st: &mut Status) {
+    st.recording = false;
+    st.recording_paused = false;
+    st.waiting_for_source = false;
+    st.recording_secs = 0.0;
+    st.segment_secs = 0.0;
+    st.segment_bytes = 0;
+    st.session_bytes = 0;
+    st.segment_index = 0;
 }
 
 fn on_session_event(app: &AppHandle, e: SessionEvent) {
@@ -367,15 +516,20 @@ fn on_session_event(app: &AppHandle, e: SessionEvent) {
             st.error = Some(msg);
             st.buffered_secs = 0.0;
             st.buffered_mb = 0.0;
-            st.recording = false;
-            st.recording_secs = 0.0;
+            reset_recording_status(st);
         }),
         SessionEvent::Status(s) => state.update_status(app, |st| {
             st.buffered_secs = s.buffered_secs;
             st.buffered_mb = s.buffered_bytes as f64 / 1e6;
             st.buffer_estimate_mb = s.buffer_estimate_mb;
             st.recording = s.recording;
+            st.recording_paused = s.recording_paused;
+            st.waiting_for_source = s.waiting_for_source;
             st.recording_secs = s.recording_secs;
+            st.segment_secs = s.segment_secs;
+            st.segment_bytes = s.segment_bytes;
+            st.session_bytes = s.session_bytes;
+            st.segment_index = s.segment_index;
             st.frames = s.frames;
             st.dropped = s.dropped;
             st.source = s.source;
@@ -386,27 +540,84 @@ fn on_session_event(app: &AppHandle, e: SessionEvent) {
                 title: s.capture_title,
             };
         }),
-        SessionEvent::ClipSaved(clip) => on_clip_saved(app, &state, clip, false),
+        SessionEvent::ClipSaved(clip) => on_clip_saved(app, &state, clip, SaveKind::ReplayClip),
         SessionEvent::SaveFailed(msg) => {
+            emit_badge_flash(
+                app,
+                BadgeFlash {
+                    kind: "save_failed",
+                    label: "SAVE FAILED",
+                    secs: None,
+                    tone: "err",
+                    duration_ms: 3500,
+                },
+            );
             let _ = app.emit("error", &msg);
             feedback::notify(app, "Clip not saved", &msg);
         }
         SessionEvent::RecordingStarted => {
             state.update_status(app, |st| {
                 st.recording = true;
-                st.recording_secs = 0.0;
+                st.recording_paused = false;
+                st.waiting_for_source = false;
             });
+            emit_badge_flash(
+                app,
+                BadgeFlash {
+                    kind: "recording_started",
+                    label: "RECORDING STARTED",
+                    secs: None,
+                    tone: "rec",
+                    duration_ms: 2200,
+                },
+            );
             if state.settings().save_sound {
                 feedback::play_chime();
             }
         }
+        SessionEvent::RecordingPaused(paused) => {
+            state.update_status(app, |st| {
+                st.recording_paused = paused;
+            });
+            emit_badge_flash(
+                app,
+                if paused {
+                    BadgeFlash {
+                        kind: "recording_paused",
+                        label: "RECORDING PAUSED",
+                        secs: None,
+                        tone: "paused",
+                        duration_ms: 2500,
+                    }
+                } else {
+                    BadgeFlash {
+                        kind: "recording_resumed",
+                        label: "RECORDING RESUMED",
+                        secs: None,
+                        tone: "rec",
+                        duration_ms: 2200,
+                    }
+                },
+            );
+        }
+        SessionEvent::SegmentSaved(clip) => on_clip_saved(app, &state, clip, SaveKind::SegmentSplit),
         SessionEvent::ScreenshotTaken(path) => {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let _ = app.emit("screenshot_flash", ());
             let announced = crate::badge::announces_clips(app);
+            emit_badge_flash(
+                app,
+                BadgeFlash {
+                    kind: "screenshot_saved",
+                    label: "SCREENSHOT SAVED",
+                    secs: None,
+                    tone: "ok",
+                    duration_ms: 3500,
+                },
+            );
+            let _ = app.emit("screenshot_flash", ());
             feedback::screenshot_saved(app, &state.settings(), &name, !announced);
         }
         SessionEvent::ScreenshotSaved(path) => {
@@ -417,18 +628,38 @@ fn on_session_event(app: &AppHandle, e: SessionEvent) {
             let _ = app.emit("error", &msg);
             feedback::notify(app, "Screenshot failed", &msg);
         }
-        SessionEvent::RecordingSaved(clip) => on_clip_saved(app, &state, clip, true),
+        SessionEvent::RecordingSaved(clip) => on_clip_saved(app, &state, clip, SaveKind::RecordingFinal),
+        SessionEvent::RecordingStoppedReason(reason) => {
+            emit_badge_flash(
+                app,
+                BadgeFlash {
+                    kind: "recording_stopped",
+                    label: "RECORDING STOPPED",
+                    secs: None,
+                    tone: "paused",
+                    duration_ms: 3500,
+                },
+            );
+            state.update_status(app, reset_recording_status);
+            feedback::notify(app, "Continuous recording stopped", &reason);
+        }
         SessionEvent::RecordingFailed(msg) => {
-            state.update_status(app, |st| {
-                st.recording = false;
-                st.recording_secs = 0.0;
-            });
+            emit_badge_flash(
+                app,
+                BadgeFlash {
+                    kind: "recording_failed",
+                    label: "RECORDING FAILED",
+                    secs: None,
+                    tone: "err",
+                    duration_ms: 3500,
+                },
+            );
+            state.update_status(app, reset_recording_status);
             let _ = app.emit("error", &msg);
             feedback::notify(app, "Recording failed", &msg);
         }
         SessionEvent::Stopped(err) => state.update_status(app, |st| {
-            st.recording = false;
-            st.recording_secs = 0.0;
+            reset_recording_status(st);
             st.capture_target = CaptureTarget::default();
             match err {
                 Some(msg) => {

@@ -8,12 +8,15 @@
 //! exactly as wide as the text, however the size and options are set. A new window stays
 //! hidden until that first measurement arrives.
 
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
-use suicap_core::config::BadgeCorner;
+use suicap_core::config::{BadgeCorner, RecordingMode};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use windows::Win32::{
     Foundation::HWND,
@@ -36,6 +39,8 @@ static REALIZED: Mutex<Want> = Mutex::new(None);
 static SIZE: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// Once shutdown starts, no new badge window may be created or shown.
 static CLOSING: AtomicBool = AtomicBool::new(false);
+/// Temporary hold so notification flashes stay visible after recording stops or saves.
+static HOLD_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -48,8 +53,42 @@ fn wanted(app: &AppHandle) -> Want {
     let state = app.state::<AppState>();
     let s = state.settings();
     let st = state.status();
-    let live = st.recording || (s.badge_during_replay && st.phase == Phase::Armed);
+    let held = lock(&HOLD_UNTIL).is_some_and(|t| Instant::now() < t);
+    let replay_idle = s.badge_during_replay
+        && st.phase == Phase::Armed
+        && (s.mode == RecordingMode::Replay || s.continuous.keep_replay_buffer);
+    let live = st.recording || st.recording_paused || st.waiting_for_source || held || replay_idle;
     (s.recording_badge && live).then_some((s.badge_corner, s.display, s.badge_margin))
+}
+
+/// Keep the badge visible for `duration` while displaying a temporary notification flash.
+pub fn hold_for_flash(app: &AppHandle, duration: Duration) {
+    if CLOSING.load(Ordering::Acquire) {
+        return;
+    }
+    let s = app.state::<AppState>().settings();
+    if !s.recording_badge || !s.badge_clip_flash {
+        return;
+    }
+    let deadline = Instant::now() + duration;
+    *lock(&HOLD_UNTIL) = Some(deadline);
+    sync(app);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(duration + Duration::from_millis(50));
+        let cleared = {
+            let mut hold = lock(&HOLD_UNTIL);
+            if hold.is_some_and(|t| t <= deadline && Instant::now() >= t) {
+                *hold = None;
+                true
+            } else {
+                false
+            }
+        };
+        if cleared && !CLOSING.load(Ordering::Acquire) {
+            sync(&app);
+        }
+    });
 }
 
 /// True when the badge is up and set to announce saved clips, so it says so itself and the
@@ -75,27 +114,47 @@ pub fn sync(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         let mut realized = lock(&REALIZED);
-        let want = wanted(&app); // newest state, in case several changes queued up
-        if *realized == want {
+        // Startup is busy (settings window, capture spinning up), so a first attempt can fail
+        // or find the previous badge still closing: retry a few times before giving up.
+        for _ in 0..4 {
+            let want = wanted(&app); // newest state, in case several changes queued up
+            if *realized == want {
+                return;
+            }
+            *realized = match want {
+                Some(w) => place(&app, w).then_some(w),
+                None => {
+                    *lock(&SIZE) = None;
+                    if let Some(w) = app.get_webview_window(BADGE) {
+                        let _ = w.close();
+                    }
+                    wait_until_gone(&app);
+                    None
+                }
+            };
+            if *realized == wanted(&app) || CLOSING.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+}
+
+/// A closing badge keeps its label for a moment; creating a new one before it is gone fails.
+fn wait_until_gone(app: &AppHandle) {
+    for _ in 0..20 {
+        if app.get_webview_window(BADGE).is_none() {
             return;
         }
-        *realized = match want {
-            Some(w) => place(&app, w).then_some(w),
-            None => {
-                *lock(&SIZE) = None;
-                if let Some(w) = app.get_webview_window(BADGE) {
-                    let _ = w.close();
-                }
-                None
-            }
-        };
-    });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Immediately hide and destroy the badge overlay during app shutdown so it cannot linger
 /// or be re-created by in-flight sync/resize threads.
 pub fn close_now(app: &AppHandle) {
     CLOSING.store(true, Ordering::Release);
+    *lock(&HOLD_UNTIL) = None;
     *lock(&REQUESTED) = None;
     *lock(&REALIZED) = None;
     *lock(&SIZE) = None;

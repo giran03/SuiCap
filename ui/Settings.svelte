@@ -2,7 +2,7 @@
   import { onMount, tick } from "svelte";
   import { slide, scale, fade, fly } from "svelte/transition";
   import { cubicOut, backOut } from "svelte/easing";
-  import { api, errorText, onStatus, onUpdate, onBadgeIcon, type AppInfo, type BadgeCorner, type CodecSupport, type Display, type PresetName, type Settings, type Status, type UpdateInfo } from "./api";
+  import { api, errorText, onStatus, onUpdate, onBadgeIcon, type AppInfo, type BadgeCorner, type CodecSupport, type Display, type PresetName, type Settings, type Status, type UpdateInfo, type VideoPreview } from "./api";
   import HotkeyInput from "./HotkeyInput.svelte";
   import AudioPage from "./AudioPage.svelte";
   import ClipsPage from "./ClipsPage.svelte";
@@ -30,15 +30,16 @@
   let status = $state<Status | null>(null);
   let displays = $state<Display[]>([]);
   let defaultDir = $state("");
+  let defaultTempDir = $state("");
   let estimate = $state(0);
-  const fmtSize = (mb: number) => (mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${mb} MB`);
   let saveError = $state("");
   let actionError = $state("");
   let settingsOpen = $state(false);
   let dashEl = $state<HTMLElement>();
-  let tab = $state<"general" | "appearance" | "updates" | "about">("general");
+  let tab = $state<"general" | "storage" | "appearance" | "updates" | "about">("general");
   const tabs = [
     { id: "general", label: "General", tile: "#8e8e93", icon: "M4 7h9M17 7h3M4 17h3M11 17h9M15 4v6M9 14v6" },
+    { id: "storage", label: "Storage", tile: "#ff9f0a", icon: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" },
     { id: "appearance", label: "Appearance", tile: "#bf5af2", icon: "M12 3a9 9 0 1 0 0 18c1.4 0 2-1 1.5-2-.6-1.3.2-2.5 1.6-2.5H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3zM7.5 11h.01M10 7.5h.01M14.5 7.5h.01" },
     { id: "updates", label: "Updates", tile: "#30d158", icon: "M12 4v11M7 11l5 5 5-5M5 20h14" },
     { id: "about", label: "About", tile: "#0a84ff", icon: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 11v5M12 8h.01" },
@@ -61,10 +62,20 @@
   ];
 
   const armed = $derived(status?.phase === "armed");
+  const cont = $derived(s.mode === "continuous");
+  const isCont = $derived((status?.mode ?? s.mode) === "continuous");
   const running = $derived(
     status?.phase === "armed" || status?.phase === "starting" || status?.phase === "recovering",
   );
-  const fill = $derived(status && status.buffer_secs ? Math.min(1, status.buffered_secs / status.buffer_secs) : 0);
+  const fill = $derived.by(() => {
+    if (!status) return 0;
+    if (isCont) {
+      if (s.continuous.segment_mins > 0) return Math.min(1, status.segment_secs / (s.continuous.segment_mins * 60));
+      if (s.continuous.segment_mb > 0) return Math.min(1, status.segment_bytes / (s.continuous.segment_mb * 1048576));
+      return status.recording ? 1 : 0;
+    }
+    return status.buffer_secs ? Math.min(1, status.buffered_secs / status.buffer_secs) : 0;
+  });
 
   // Last settings the backend accepted; "Undo" returns to them.
   // svelte-ignore state_referenced_locally
@@ -74,7 +85,8 @@
 
   /** The settings that restart capture when changed (mirrors the shell's capture_key). */
   function captureKey(x: Settings): string {
-    const { preset, custom, buffer_secs, container, clips_dir, cursor, display, source } = x;
+    const { preset, custom, buffer_secs, container, clips_dir, cursor, display, source, mode } = x;
+    const keep_replay_buffer = x.continuous.keep_replay_buffer;
     // The on/off switches of tracks the running session has mute live: they never restart capture.
     const audio = { ...x.audio, tracks: { ...x.audio.tracks } };
     const live = status?.audio_live;
@@ -91,7 +103,7 @@
     audio.voice = [];
     audio.media = [];
     audio.ignored = [];
-    return JSON.stringify({ preset, custom, buffer_secs, container, clips_dir, cursor, display, source, audio });
+    return JSON.stringify({ preset, custom, buffer_secs, container, clips_dir, cursor, display, source, mode, keep_replay_buffer, audio });
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -146,6 +158,37 @@
   }
 
   const fmtBuffer = (v: number) => (v >= 60 ? `${Math.floor(v / 60)} min${v % 60 ? ` ${v % 60} s` : ""}` : `${v} s`);
+  const fmtClock = (secs: number) => {
+    const n = Math.max(0, Math.floor(secs));
+    const h = Math.floor(n / 3600);
+    const m = Math.floor((n % 3600) / 60);
+    const sec = n % 60;
+    return h ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
+  };
+  const fmtBytes = (b: number) =>
+    b >= 1073741824 ? `${(b / 1073741824).toFixed(2)} GB` : b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : b >= 1024 ? `${Math.round(b / 1024)} KB` : `${b} B`;
+  const fmtMinsOff = (v: number, offLabel = "Off") => {
+    if (v <= 0) return offLabel;
+    const h = Math.floor(v / 60);
+    const m = v % 60;
+    return h ? `${h} h${m ? ` ${m} min` : ""}` : `${v} min`;
+  };
+  function parseMins(text: string): number | null {
+    const x = text.trim().toLowerCase();
+    if (x === "off" || x === "unlimited" || x === "none") return 0;
+    let m = x.match(/^(\d+)\s*h\s*(\d+)?\s*m?(?:in)?$/);
+    if (m) return +m[1] * 60 + +(m[2] ?? 0);
+    m = x.match(/^(\d+(?:\.\d+)?)\s*(?:m|min|mins|minutes?)?$/);
+    return m ? +m[1] : null;
+  }
+  const segmentSizeOptions = [
+    { value: 0, label: "No limit" },
+    { value: 500, label: "500 MB" },
+    { value: 1024, label: "1 GB" },
+    { value: 2048, label: "2 GB" },
+    { value: 4096, label: "4 GB" },
+    { value: 10240, label: "10 GB" },
+  ];
   /** "90", "90s", "1:30" or "1m30s" to seconds. */
   function parseBuffer(text: string): number | null {
     const x = text.trim().toLowerCase();
@@ -172,6 +215,8 @@
     { key: "save_full", label: "Save whole buffer", def: "Ctrl+Alt+F12" },
     { key: "screenshot", label: "Take a screenshot", def: "Ctrl+Alt+F8" },
     { key: "target_app", label: "Record the app in front", def: "Ctrl+Alt+F7" },
+    { key: "record_toggle", label: "Start or stop recording", def: "Ctrl+Alt+F6" },
+    { key: "record_pause", label: "Pause or resume recording", def: "" },
   ];
   const hotkeyRows = $derived(
     hotkeyDefs.map((h) => {
@@ -187,22 +232,45 @@
   const clearAllHotkeys = () => edit((d) => hotkeyDefs.forEach((h) => (d.hotkeys[h.key] = "")));
 
   // ---- Context menus ----
-  /** Replay status card and the sidebar status: turn on/off, save, open. */
+  /** Replay/Continuous status card and the sidebar status: turn on/off, save/record, open. */
   function replayMenu(e: MouseEvent) {
-    const items: MenuItem[] = [
-      running
-        ? { label: "Turn replay off", run: () => act(api.disarm) }
-        : { label: "Turn replay on", run: () => act(api.arm) },
-      { separator: true },
-      { header: "Save clip" },
-      { label: "Last 15 seconds", disabled: !armed, run: () => save(15) },
-      { label: "Last 30 seconds", disabled: !armed, run: () => save(30) },
-      { label: "Last 60 seconds", disabled: !armed, run: () => save(60) },
-      { label: "Whole buffer", disabled: !armed, run: () => save(null) },
-      { separator: true },
-      { label: "Show last clip", disabled: !status?.last_clip, run: () => act(api.revealLastClip) },
-      { label: "Open clips folder", run: () => act(api.openClipsFolder) },
-    ];
+    const items: MenuItem[] = isCont
+      ? [
+          running
+            ? { label: "Turn capture off", run: () => act(api.disarm) }
+            : { label: "Turn capture on", run: () => act(api.arm) },
+          { separator: true },
+          status?.recording || status?.waiting_for_source
+            ? { label: "Stop recording", run: () => act(api.recordStop) }
+            : { label: "Start recording", disabled: !armed, run: () => act(api.recordStart) },
+          {
+            label: status?.recording_paused ? "Resume recording" : "Pause recording",
+            disabled: !armed || !status?.recording,
+            run: () => act(api.recordPause),
+          },
+          {
+            label: "Split segment now",
+            disabled: !armed || !status?.recording || Boolean(status?.recording_paused),
+            run: () => act(api.recordSplit),
+          },
+          { separator: true },
+          { label: "Show last clip", disabled: !status?.last_clip, run: () => act(api.revealLastClip) },
+          { label: "Open clips folder", run: () => act(api.openClipsFolder) },
+        ]
+      : [
+          running
+            ? { label: "Turn replay off", run: () => act(api.disarm) }
+            : { label: "Turn replay on", run: () => act(api.arm) },
+          { separator: true },
+          { header: "Save clip" },
+          { label: "Last 15 seconds", disabled: !armed, run: () => save(15) },
+          { label: "Last 30 seconds", disabled: !armed, run: () => save(30) },
+          { label: "Last 60 seconds", disabled: !armed, run: () => save(60) },
+          { label: "Whole buffer", disabled: !armed, run: () => save(null) },
+          { separator: true },
+          { label: "Show last clip", disabled: !status?.last_clip, run: () => act(api.revealLastClip) },
+          { label: "Open clips folder", run: () => act(api.openClipsFolder) },
+        ];
     showMenu(e, items);
   }
 
@@ -213,6 +281,16 @@
       { label: "Use the default folder", disabled: !s.clips_dir, run: () => edit((d) => (d.clips_dir = null)) },
       { separator: true },
       { label: "Copy path", run: () => copyText(s.clips_dir ?? defaultDir) },
+    ]);
+  }
+
+  function tempFolderMenu(e: MouseEvent) {
+    showMenu(e, [
+      { label: "Open temp folder", run: () => act(api.openTempFolder) },
+      { label: "Change folder…", run: pickTempDir },
+      { label: "Use the default folder", disabled: !s.temp_dir, run: () => edit((d) => (d.temp_dir = null)) },
+      { separator: true },
+      { label: "Copy path", run: () => copyText(s.temp_dir ?? defaultTempDir) },
     ]);
   }
 
@@ -232,9 +310,23 @@
     if (dir) edit((d) => (d.clips_dir = dir));
   }
 
+  async function pickTempDir() {
+    const dir = await api.pickTempDir().catch((e) => ((actionError = errorText(e)), null));
+    if (dir) edit((d) => (d.temp_dir = dir));
+  }
+
   function phaseText(st: Status | null): string {
+    const continuous = (st?.mode ?? s.mode) === "continuous";
     switch (st?.phase) {
       case "armed":
+        if (continuous) {
+          if (st.recording && st.recording_paused) return "Recording paused";
+          if (st.recording) return "Recording";
+          if (st.waiting_for_source) {
+            return st.capture_target.exe ? `Waiting for ${friendlyName(st.capture_target.exe)}` : "Waiting for source";
+          }
+          return "Continuous ready";
+        }
         return "Replay on";
       case "starting":
         return "Starting capture…";
@@ -243,7 +335,7 @@
       case "error":
         return "Capture stopped";
       default:
-        return "Replay off";
+        return continuous ? "Continuous off" : "Replay off";
     }
   }
 
@@ -287,7 +379,15 @@
   /** What the badge shows right now, mirrored in the corner picker; a sample when nothing runs. */
   const badgePreview = $derived.by(() => {
     const clock = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
-    if (status?.recording) return { rec: true, sample: false, label: s.badge_label_rec, time: clock(status.recording_secs) };
+    if (status?.recording) {
+      const secs = isCont ? status.segment_secs : status.recording_secs;
+      return {
+        rec: !status.recording_paused,
+        sample: false,
+        label: status.recording_paused ? "PAUSED" : s.badge_label_rec,
+        time: clock(secs),
+      };
+    }
     if (armed && s.badge_during_replay)
       return { rec: false, sample: false, label: s.badge_label_replay, time: `${Math.round(status?.buffered_secs ?? 0)} s` };
     return { rec: true, sample: true, label: s.badge_label_rec, time: "0:12" };
@@ -467,6 +567,87 @@
   }
   const recordOnly = (exe: string) => setSource((x) => ((x.kind = "app"), (x.exe = exe), (x.title = "")));
 
+  // ---- Video preview ----
+  let preview = $state<VideoPreview | null>(null);
+  let previewLive = $state(true);
+  let previewBadgeOverlay = $state(false);
+  let previewBusy = $state(false);
+  let previewError = $state("");
+  let previewQueued = false;
+
+  const previewKey = $derived(
+    JSON.stringify([
+      src.kind,
+      src.exe,
+      src.title,
+      src.fallback,
+      s.display,
+      s.cursor,
+      s.preset,
+      s.custom.width,
+      s.custom.height,
+      s.custom.fps,
+    ]),
+  );
+
+  const previewSub = $derived.by(() => {
+    if (preview?.kind === "window" && preview.exe) return friendlyName(preview.exe);
+    if (preview?.kind === "waiting") return src.exe ? `Waiting for ${friendlyName(src.exe)}` : "Waiting for app";
+    if (preview?.fallback_active && src.exe) return `Display (fallback for ${friendlyName(src.exe)})`;
+    if (src.kind === "auto") return "Auto · Display";
+    return s.display ? `Display ${s.display}` : "Main display";
+  });
+
+  const previewOutText = $derived(
+    preview ? `${preview.output_width}×${preview.output_height} @ ${preview.fps} fps` : "1920×1080 @ 60 fps",
+  );
+
+  const previewScaleTag = $derived.by(() => {
+    if (!preview || preview.source_width <= 0 || preview.source_height <= 0) return "";
+    if (preview.source_width === preview.output_width && preview.source_height === preview.output_height) {
+      return "Native 1:1";
+    }
+    const srcAr = preview.source_width / preview.source_height;
+    const outAr = preview.output_width / preview.output_height;
+    const fit = Math.abs(srcAr - outAr) > 0.02 ? " · letterboxed" : " · scaled";
+    return `Src ${preview.source_width}×${preview.source_height}${fit}`;
+  });
+
+  async function refreshPreview(force = false) {
+    if (!force && (!previewLive || document.hidden || settingsOpen)) return;
+    if (previewBusy) {
+      if (force) previewQueued = true;
+      return;
+    }
+    previewBusy = true;
+    try {
+      preview = await api.videoPreview($state.snapshot(s) as Settings);
+      previewError = "";
+    } catch (e) {
+      previewError = errorText(e);
+    } finally {
+      previewBusy = false;
+      if (previewQueued) {
+        previewQueued = false;
+        refreshPreview(true);
+      }
+    }
+  }
+
+  function togglePreviewLive() {
+    previewLive = !previewLive;
+    if (previewLive) {
+      refreshPreview(true);
+    } else {
+      api.closeVideoPreview().catch(() => {});
+    }
+  }
+
+  $effect(() => {
+    void previewKey;
+    refreshPreview(true);
+  });
+
   // The game in front: the full-screen app, else a running app from the Game track.
   let game = $state<string | null>(null);
   async function pollGame() {
@@ -490,6 +671,7 @@
     if (src.kind === "app") loadWindows();
     const gameTimer = setInterval(pollGame, 3000);
     const winTimer = setInterval(() => !document.hidden && src.kind === "app" && loadWindows(), 4000);
+    const previewTimer = setInterval(() => refreshPreview(false), 900);
     api.updateInfo().then((u) => (update = u));
     loadSupport();
     api.appInfo().then((i) => (appInfo = i));
@@ -500,10 +682,13 @@
     api.status().then((st) => (status = st));
     api.displays().then((d) => (displays = d));
     api.defaultClipsDir().then((d) => (defaultDir = d));
+    api.defaultTempDir().then((d) => (defaultTempDir = d));
     api.estimateMb($state.snapshot(s) as Settings).then((m) => (estimate = m));
     return () => {
       clearInterval(gameTimer);
       clearInterval(winTimer);
+      clearInterval(previewTimer);
+      api.closeVideoPreview().catch(() => {});
       un.then((f) => f());
       unUpdate.then((f) => f());
       unIcon.then((f) => f());
@@ -523,7 +708,10 @@
 <div class="shell">
   <Rail
     scrollEl={dashEl}
+    mode={s.mode}
     {armed}
+    recording={Boolean(status?.recording)}
+    paused={Boolean(status?.recording_paused)}
     hasError={status?.phase === "error"}
     {settingsOpen}
     {upBadge}
@@ -560,7 +748,19 @@
         {#if armed && status}
           <span class="stat">{status.encoder}</span>
           <span class="stat">{status.resolution}</span>
-          <span class="stat">{Math.min(status.buffered_secs, status.buffer_secs).toFixed(0)} / {status.buffer_secs} s</span>
+          {#if isCont}
+            <span class="stat">
+              {#if status.recording}
+                {fmtClock(status.segment_secs)} · {fmtBytes(status.session_bytes)}
+              {:else if status.waiting_for_source}
+                Waiting
+              {:else}
+                Standby
+              {/if}
+            </span>
+          {:else}
+            <span class="stat">{Math.min(status.buffered_secs, status.buffer_secs).toFixed(0)} / {status.buffer_secs} s</span>
+          {/if}
         {/if}
         <span class="stat">{s.audio.enabled ? "Audio on" : "Audio off"}</span>
       </div>
@@ -584,19 +784,56 @@
     <div class="grid">
       <div class="stack">
       <section class="panel p-replay" id="replay">
-        <div class="p-head"><h2>Replay</h2><span class="p-sub">Last {s.buffer_secs} s kept in memory</span></div>
+        <div class="p-head mode-head">
+          <div class="p-title">
+            <h2>{cont ? "Continuous recording" : "Replay"}</h2>
+            <span class="p-sub">
+              {#if cont}
+                {s.continuous.segment_mins > 0 ? `Auto-splits every ${s.continuous.segment_mins} min` : "Single continuous file"}
+              {:else}
+                Last {s.buffer_secs} s kept in memory
+              {/if}
+            </span>
+          </div>
+          <Seg
+            label="Capture mode"
+            options={[
+              { value: "replay" as const, label: "Replay" },
+              { value: "continuous" as const, label: "Continuous" },
+            ]}
+            value={s.mode}
+            onselect={(m) => edit((d) => (d.mode = m))}
+          />
+        </div>
           <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <section class="card status" class:on={armed} class:err={status?.phase === "error"} oncontextmenu={replayMenu}>
+          <section
+            class="card status"
+            class:on={armed}
+            class:rec={Boolean(armed && status?.recording && !status?.recording_paused)}
+            class:paused={Boolean(armed && status?.recording && status?.recording_paused)}
+            class:err={status?.phase === "error"}
+            oncontextmenu={replayMenu}
+          >
             <div class="status-top">
               <div>
                 <div class="status-phase" class:shimmer={status?.phase === "starting" || status?.phase === "recovering"}><span class="dot"></span>{phaseText(status)}</div>
                 <div class="status-detail">
                   {#if armed && status}
-                    <span class="chips"><span class="chip">{status.encoder}</span><span class="chip">{status.resolution}</span></span>
+                    <span class="chips">
+                      <span class="chip">{status.encoder}</span>
+                      <span class="chip">{status.resolution}</span>
+                      {#if isCont && status.segment_index > 0}
+                        <span class="chip">Part #{status.segment_index}</span>
+                      {/if}
+                    </span>
                   {:else if status?.phase === "error" || status?.phase === "recovering"}
                     {status.error}
                   {:else if !running}
-                    Turn replay on to keep the last {s.buffer_secs} seconds in memory.
+                    {#if cont}
+                      Turn capture on to record directly to disk{s.continuous.segment_mins > 0 ? ` in ${s.continuous.segment_mins} min segments` : ""}.
+                    {:else}
+                      Turn replay on to keep the last {s.buffer_secs} seconds in memory.
+                    {/if}
                   {/if}
                 </div>
               </div>
@@ -606,30 +843,83 @@
                 <button class="btn primary" onclick={() => act(api.arm)}>Turn on</button>
               {/if}
             </div>
-            <div class="meter big"><span style="width: {fill * 100}%"></span></div>
-            {#if armed && status}
+            <div class="meter big" class:busy={isCont && armed && Boolean(status?.recording) && !status?.recording_paused && s.continuous.segment_mins === 0 && s.continuous.segment_mb === 0}><span style="width: {fill * 100}%"></span></div>
+            {#if armed && status && isCont}
+              <div class="tiles">
+                <div class="tile-stat">
+                  <span>{status.waiting_for_source && !status.recording ? "Status" : "Current part"}</span>
+                  <b>{status.waiting_for_source && !status.recording ? "Waiting" : fmtClock(status.segment_secs)}</b>
+                  <small>
+                    {#if s.continuous.segment_mins > 0}
+                      of {s.continuous.segment_mins} min{status.segment_index > 0 ? ` · ${fmtClock(status.recording_secs)} total` : ""}
+                    {:else if status.segment_index > 0}
+                      Part #{status.segment_index} · {fmtClock(status.recording_secs)} total
+                    {:else}
+                      Ready
+                    {/if}
+                  </small>
+                </div>
+                <div class="tile-stat">
+                  <span>Disk written</span>
+                  <b>{fmtBytes(status.session_bytes)}</b>
+                  <small>{status.segment_bytes > 0 ? `${fmtBytes(status.segment_bytes)} this part` : "Direct to disk"}</small>
+                </div>
+                <div class="tile-stat" class:bad={status.dropped > 0}><span>Dropped</span><b>{status.dropped}</b><small>frames</small></div>
+              </div>
+            {:else if armed && status}
               <div class="tiles">
                 <div class="tile-stat"><span>Buffered</span><b>{Math.min(status.buffered_secs, status.buffer_secs).toFixed(0)} s</b><small>of {status.buffer_secs} s</small></div>
                 <div class="tile-stat"><span>Memory</span><b>{status.buffered_mb.toFixed(0)} MB</b><small>in the buffer</small></div>
-                <div class="tile-stat" title="The most a clip of the whole buffer can weigh at the highest bitrate of your quality preset, video only. Real clips are usually smaller."><span>Clip size</span><b>{fmtSize(status.buffer_estimate_mb || estimate)}</b><small>est. for {status.buffer_secs} s</small></div>
                 <div class="tile-stat" class:bad={status.dropped > 0}><span>Dropped</span><b>{status.dropped}</b><small>frames</small></div>
               </div>
             {:else}
-              <div class="meter-legend"><span>{status ? Math.min(status.buffered_secs, status.buffer_secs).toFixed(0) : 0} of {status?.buffer_secs ?? s.buffer_secs} s buffered</span></div>
-            {/if}
-            <div class="save-row">
-              <div class="save-group">
-                <span class="label">Save</span>
-                <button class="btn" disabled={!armed} onclick={() => save(15)}>15 s</button>
-                <button class="btn" disabled={!armed} onclick={() => save(30)}>30 s</button>
-                <button class="btn" disabled={!armed} onclick={() => save(60)}>60 s</button>
-                <button class="btn" disabled={!armed} onclick={() => save(null)}>Whole buffer</button>
-                <span class="check-slot">
-                  {#key savedFlash}
-                    {#if savedFlash}<span class="check" aria-label="Clip saved">✓</span>{/if}
-                  {/key}
+              <div class="meter-legend">
+                <span>
+                  {#if isCont}
+                    {s.continuous.segment_mins > 0 ? `Auto-cut every ${s.continuous.segment_mins} min` : "Single file until stopped"}
+                  {:else}
+                    {status ? Math.min(status.buffered_secs, status.buffer_secs).toFixed(0) : 0} of {status?.buffer_secs ?? s.buffer_secs} s buffered
+                  {/if}
                 </span>
               </div>
+            {/if}
+            <div class="save-row">
+              {#if cont}
+                <div class="save-group">
+                  {#if status?.recording || status?.waiting_for_source}
+                    <button class="btn danger" disabled={!armed} onclick={() => act(api.recordStop)}>Stop</button>
+                  {:else}
+                    <button class="btn primary" disabled={!armed} onclick={() => act(api.recordStart)}>Start</button>
+                  {/if}
+                  <button class="btn" disabled={!armed || !status?.recording} onclick={() => act(api.recordPause)}>
+                    {status?.recording_paused ? "Resume" : "Pause"}
+                  </button>
+                  <button class="btn" disabled={!armed || !status?.recording || Boolean(status?.recording_paused)} onclick={() => act(api.recordSplit)}>
+                    Split now
+                  </button>
+                  {#if s.continuous.keep_replay_buffer}
+                    <button class="btn" disabled={!armed || (status?.buffered_secs ?? 0) <= 0} onclick={() => save(null)}>Save replay</button>
+                  {/if}
+                  <span class="check-slot">
+                    {#key savedFlash}
+                      {#if savedFlash}<span class="check" aria-label="Clip saved">✓</span>{/if}
+                    {/key}
+                  </span>
+                </div>
+              {:else}
+                <div class="save-group">
+                  <span class="label">Save</span>
+                  <button class="btn" disabled={!armed} onclick={() => save(15)}>15 s</button>
+                  <button class="btn" disabled={!armed} onclick={() => save(30)}>30 s</button>
+                  <button class="btn" disabled={!armed} onclick={() => save(60)}>60 s</button>
+                  <button class="btn" disabled={!armed} onclick={() => save(null)}>Whole buffer</button>
+                  <span class="check-slot">
+                    {#key savedFlash}
+                      {#if savedFlash}<span class="check" aria-label="Clip saved">✓</span>{/if}
+                    {/key}
+                  </span>
+                </div>
+              {/if}
               <div class="save-group more">
                 <button class="btn ghost" disabled={!armed} onclick={() => act(api.screenshot)}>Screenshot</button>
                 {#if status?.last_clip}
@@ -643,24 +933,123 @@
       </section>
 
       <section class="panel p-buffer">
-        <div class="p-head"><h2>Buffer and files</h2></div>
+        <div class="p-head"><h2>{cont ? "Continuous and files" : "Buffer and files"}</h2></div>
           <section class="card">
-            <div class="row">
-              {@render row("Buffer length", `Up to ${estimate} MB of memory at the maximum bitrate.`)}
-              <SliderField
-                label="Buffer length in seconds"
-                min={10}
-                max={600}
-                step={5}
-                defaultValue={120}
-                presets={[30, 60, 120, 300, 600]}
-                value={s.buffer_secs}
-                format={fmtBuffer}
-                unitHint="seconds, or m:ss"
-                parse={parseBuffer}
-                onchange={(v) => edit((d) => (d.buffer_secs = v), 400)}
-              />
-            </div>
+            {#if cont}
+              <div class="row">
+                {@render row("Auto-split every", s.continuous.segment_mins === 0 ? "Keep recording in one continuous file until stopped." : `Cut cleanly onto a new file every ${fmtMinsOff(s.continuous.segment_mins)} with zero gap.`)}
+                <SliderField
+                  label="Auto-split interval in minutes"
+                  min={0}
+                  max={240}
+                  step={5}
+                  hardMin={0}
+                  hardMax={240}
+                  defaultValue={15}
+                  presets={[0, 5, 10, 15, 30, 60, 120]}
+                  value={s.continuous.segment_mins}
+                  format={(v) => fmtMinsOff(v, "Off")}
+                  unitHint="minutes, or Off"
+                  parse={parseMins}
+                  onchange={(v) => edit((d) => (d.continuous.segment_mins = v), 350)}
+                />
+              </div>
+              <div class="row">
+                {@render row("Max file size", "Also split onto a new file before an individual recording grows past this size.")}
+                <Select
+                  label="Maximum file size per segment"
+                  options={segmentSizeOptions}
+                  value={s.continuous.segment_mb}
+                  onselect={(v) => edit((d) => (d.continuous.segment_mb = v))}
+                />
+              </div>
+              <div class="row">
+                {@render row("Max session length", "Automatically stop and save after this much active recording time.")}
+                <SliderField
+                  label="Maximum session duration in minutes"
+                  min={0}
+                  max={720}
+                  step={15}
+                  hardMin={0}
+                  hardMax={1440}
+                  defaultValue={0}
+                  presets={[0, 30, 60, 120, 240, 480]}
+                  value={s.continuous.max_mins}
+                  format={(v) => fmtMinsOff(v, "Unlimited")}
+                  unitHint="minutes (min 5), or Unlimited"
+                  parse={parseMins}
+                  onchange={(v) => edit((d) => (d.continuous.max_mins = v > 0 && v < 5 ? 5 : v), 350)}
+                />
+              </div>
+              <div class="row">
+                {@render row("Wait for game or app", "In Auto or App mode (without fallback), wait at 0 MB/s until the target window is active.")}
+                <Toggle on={s.continuous.wait_for_source} label="Wait for game or app" onchange={(v) => edit((d) => (d.continuous.wait_for_source = v))} />
+              </div>
+              <div class="row">
+                {@render row("Split when app switches", "Finalize the active file and start a new one inside the new app's folder.")}
+                <Toggle on={s.continuous.split_on_app_change} label="Split when app switches" onchange={(v) => edit((d) => (d.continuous.split_on_app_change = v))} />
+              </div>
+              <div class="row">
+                {@render row("Pause when idle", "Auto-pause when there is no mouse or keyboard input; resumes seamlessly on return.")}
+                <SliderField
+                  label="Idle auto-pause in minutes"
+                  min={0}
+                  max={120}
+                  step={5}
+                  hardMin={0}
+                  hardMax={240}
+                  defaultValue={0}
+                  presets={[0, 5, 10, 15, 30, 60]}
+                  value={s.continuous.idle_pause_mins}
+                  format={(v) => fmtMinsOff(v, "Off")}
+                  unitHint="minutes, or Off"
+                  parse={parseMins}
+                  onchange={(v) => edit((d) => (d.continuous.idle_pause_mins = v), 350)}
+                />
+              </div>
+              <div class="row">
+                {@render row("Minimum free disk space", "Stop and finalize safely before your clips drive runs below this reserve.")}
+                <SliderField
+                  label="Minimum free disk space in GB"
+                  min={1}
+                  max={250}
+                  step={1}
+                  hardMin={1}
+                  hardMax={1000}
+                  defaultValue={5}
+                  presets={[2, 5, 10, 20, 50, 100]}
+                  value={s.continuous.min_free_gb}
+                  format={(v) => `${v} GB`}
+                  unitHint="GB"
+                  onchange={(v) => edit((d) => (d.continuous.min_free_gb = v), 350)}
+                />
+              </div>
+              <div class="row">
+                {@render row("Keep replay buffer active", `Keep clipping the last ${s.buffer_secs} s in memory (~${estimate} MB) while recording continuously.`)}
+                <Toggle on={s.continuous.keep_replay_buffer} label="Keep replay buffer active" onchange={(v) => edit((d) => (d.continuous.keep_replay_buffer = v))} />
+              </div>
+              <div class="row">
+                {@render row("Notify on automatic split", "Play sound and show notification when segments roll over.")}
+                <Toggle on={s.continuous.notify_on_split} label="Notify on automatic split" onchange={(v) => edit((d) => (d.continuous.notify_on_split = v))} />
+              </div>
+            {:else}
+              <div class="row">
+                {@render row("Buffer length", `Up to ${estimate} MB of memory at the maximum bitrate.`)}
+                <SliderField
+                  label="Buffer length in seconds"
+                  min={10}
+                  max={600}
+                  step={5}
+                  defaultValue={120}
+                  presets={[30, 60, 120, 300, 600]}
+                  value={s.buffer_secs}
+                  format={fmtBuffer}
+                  unitHint="seconds, or m:ss"
+                  parse={parseBuffer}
+                  onchange={(v) => edit((d) => (d.buffer_secs = v), 400)}
+                />
+              </div>
+            {/if}
             <div class="row">
               {@render row("File format", "MP4 plays everywhere. MKV shows each audio track's name in players like mpv and VLC.")}
               <Seg
@@ -681,6 +1070,16 @@
                   <button class="btn ghost" onclick={() => edit((d) => (d.clips_dir = null))}>Use default</button>
                 {/if}
                 <button class="btn" onclick={pickDir}>Change…</button>
+              </div>
+            </div>
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="row" oncontextmenu={tempFolderMenu}>
+              {@render row("Temp folder", s.temp_dir ?? defaultTempDir)}
+              <div class="inline">
+                {#if s.temp_dir}
+                  <button class="btn ghost" onclick={() => edit((d) => (d.temp_dir = null))}>Use default</button>
+                {/if}
+                <button class="btn" onclick={pickTempDir}>Change…</button>
               </div>
             </div>
           </section>
@@ -738,7 +1137,110 @@
       </div>
 
       <div class="stack">
-      <section class="panel p-video" id="video">
+      <section class="panel p-preview" id="video">
+        <div class="p-head mode-head">
+          <div class="p-title">
+            <h2>Preview</h2>
+            <span class="p-sub">{previewSub}</span>
+          </div>
+          <div class="preview-tools">
+            {#if s.recording_badge}
+              <button
+                class="preview-toggle"
+                class:on={previewBadgeOverlay}
+                title="Preview the corner badge overlay on the stage (never recorded in clips)"
+                onclick={() => (previewBadgeOverlay = !previewBadgeOverlay)}
+              >
+                Badge
+              </button>
+            {/if}
+            <button
+              class="preview-toggle"
+              class:on={previewLive}
+              title={previewLive ? "Pause live preview" : "Resume live preview"}
+              onclick={togglePreviewLive}
+            >
+              <i class="dot"></i>{previewLive ? "Live" : "Paused"}
+            </button>
+            <button
+              class="icon-btn"
+              title="Refresh preview"
+              aria-label="Refresh preview"
+              disabled={previewBusy}
+              onclick={() => refreshPreview(true)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v5h-5" /></svg>
+            </button>
+          </div>
+        </div>
+        <div class="preview-frame-box">
+          <div
+            class="preview-stage"
+            style="--ar: {(preview?.output_width ?? 16) / (preview?.output_height ?? 9)}; aspect-ratio: {preview ? `${preview.output_width} / ${preview.output_height}` : '16 / 9'}"
+          >
+            {#if !previewLive && !preview?.frame}
+              <div class="preview-empty">
+                <p>Preview paused</p>
+                <button class="btn" onclick={togglePreviewLive}>Resume preview</button>
+              </div>
+            {:else if preview?.kind === "waiting" || (src.kind === "app" && !src.exe)}
+              <div class="preview-empty">
+                {#if src.exe}
+                  <AppIcon exe={src.exe} size={30} />
+                {/if}
+                <b>{src.exe ? `Waiting for ${friendlyName(src.exe)}` : "Choose an application"}</b>
+                <span>{src.exe ? "Fallback to display is off — holding until the window opens." : "Select an open window or add a program below."}</span>
+              </div>
+            {:else if preview?.frame}
+              <img class="preview-img" src={preview.frame} alt="Preview of {previewSub}" draggable="false" />
+            {:else}
+              <div class="preview-empty">
+                <span>Loading preview…</span>
+              </div>
+            {/if}
+
+            <div class="preview-pill" class:on={preview?.kind === "display" && !preview?.fallback_active} class:live={preview?.kind === "window"} class:warn={Boolean(preview?.fallback_active || preview?.kind === "waiting")}>
+              <i class="dot"></i>
+              {#if preview?.kind === "window" && preview.exe}
+                <AppIcon exe={preview.exe} size={14} />
+                <span>{friendlyName(preview.exe)}{preview.title ? ` · ${preview.title}` : ""}</span>
+              {:else if preview?.fallback_active}
+                <span>Display fallback · {src.exe ? friendlyName(src.exe) : "Game"}</span>
+              {:else if preview?.kind === "waiting"}
+                <span>Waiting for {src.exe ? friendlyName(src.exe) : "app"}</span>
+              {:else}
+                <span>{s.display ? `Display ${s.display}` : "Main display"}</span>
+              {/if}
+            </div>
+
+            {#if previewBadgeOverlay && s.recording_badge}
+              <div class="preview-badge {s.badge_corner}" title="Badge appears on your monitor only — hidden from clips">
+                <span class="mini preview-mini" class:rec={badgePreview.rec} style={miniStyle}>
+                  {#if s.badge_icon !== "none" || !((s.badge_show_label && badgePreview.label.trim()) || s.badge_show_time)}
+                    <span class="mini-icon"><BadgeIcon icon={s.badge_icon === "none" ? "dot" : s.badge_icon} src={customIcon} /></span>
+                  {/if}
+                  {#if s.badge_show_label && badgePreview.label.trim()}<b>{badgePreview.label}</b>{/if}
+                  {#if s.badge_show_time}<em>{badgePreview.time}</em>{/if}
+                </span>
+              </div>
+            {/if}
+          </div>
+        </div>
+        <div class="preview-meta">
+          <span class="preview-chip">{previewOutText}</span>
+          {#if previewScaleTag}
+            <span class="preview-chip">{previewScaleTag}</span>
+          {/if}
+          <span class="preview-chip">{s.cursor ? "Cursor on" : "Cursor hidden"}</span>
+        </div>
+        {#if previewError}
+          <p class="preview-note warn">{previewError}</p>
+        {:else if preview?.note}
+          <p class="preview-note">{preview.note}</p>
+        {/if}
+      </section>
+
+      <section class="panel p-video">
         <div class="p-head"><h2>Video</h2><span class="p-sub">{presets.find((x) => x.id === s.preset)?.name}</span></div>
           <div class="source">
             <div class="src-head"><span class="src-title">Source</span><span class="src-line" class:live={target?.kind === "window"}>{sourceLine}</span></div>
@@ -932,18 +1434,95 @@
               <Toggle on={s.autostart} label="Start with Windows" onchange={(v) => edit((d) => (d.autostart = v))} />
             </div>
             <div class="row">
-              {@render row("Turn replay on at start", "")}
-              <Toggle on={s.arm_on_start} label="Turn replay on at start" onchange={(v) => edit((d) => (d.arm_on_start = v))} />
+              {@render row(cont ? "Turn capture on at start" : "Turn replay on at start", "")}
+              <Toggle on={s.arm_on_start} label={cont ? "Turn capture on at start" : "Turn replay on at start"} onchange={(v) => edit((d) => (d.arm_on_start = v))} />
             </div>
           </section>
           <h2>Data</h2>
           <section class="card">
             <div class="row">
-              {@render row("Clips folder", "Where saved clips go.")}
-              <button class="btn" onclick={() => act(api.openClipsFolder)}>Open</button>
+              {@render row("Storage and folders", s.clips_dir ?? defaultDir)}
+              <div class="inline">
+                <button class="btn ghost" onclick={() => (tab = "storage")}>Manage…</button>
+                <button class="btn" onclick={() => act(api.openClipsFolder)}>Open</button>
+              </div>
             </div>
           </section>
           <p class="foot">Closing the window keeps SuiCap running in the tray. Quit from the tray menu.</p>
+            {:else if tab === "storage"}
+          <h1>Storage</h1>
+          <h2>Folders</h2>
+          <section class="card">
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="row" oncontextmenu={folderMenu}>
+              {@render row("Clips folder", s.clips_dir ?? defaultDir)}
+              <div class="inline">
+                {#if s.clips_dir}
+                  <button class="btn ghost" onclick={() => edit((d) => (d.clips_dir = null))}>Use default</button>
+                {/if}
+                <button class="btn ghost" onclick={() => act(api.openClipsFolder)}>Open</button>
+                <button class="btn" onclick={pickDir}>Change…</button>
+              </div>
+            </div>
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div class="row" oncontextmenu={tempFolderMenu}>
+              {@render row("Temp folder", `${s.temp_dir ?? defaultTempDir} — holds in-progress recordings and MP4 staging.`)}
+              <div class="inline">
+                {#if s.temp_dir}
+                  <button class="btn ghost" onclick={() => edit((d) => (d.temp_dir = null))}>Use default</button>
+                {/if}
+                <button class="btn ghost" onclick={() => act(api.openTempFolder)}>Open</button>
+                <button class="btn" onclick={pickTempDir}>Change…</button>
+              </div>
+            </div>
+          </section>
+          <h2>Format and limits</h2>
+          <section class="card">
+            <div class="row">
+              {@render row("File format", "MP4 plays everywhere. MKV names every audio track in players like mpv and VLC.")}
+              <Seg
+                label="File format"
+                options={[
+                  { value: "mp4", label: "MP4" },
+                  { value: "mkv", label: "MKV" },
+                ]}
+                value={s.container}
+                onselect={(c) => edit((d) => (d.container = c))}
+              />
+            </div>
+            <div class="row">
+              {@render row("Storage limit", s.clips_quota_gb ? `Past ${s.clips_quota_gb} GB the oldest clips are deleted for good. Clips from the last 2 minutes are always kept.` : "Off. Saved clips stay until you delete them.")}
+              <SliderField
+                label="Storage limit in GB"
+                min={0}
+                max={500}
+                step={5}
+                hardMax={100000}
+                defaultValue={0}
+                presets={[0, 50, 100, 250, 500]}
+                value={s.clips_quota_gb}
+                format={(v) => (v === 0 ? "Off" : `${v} GB`)}
+                onchange={(v) => edit((d) => (d.clips_quota_gb = Math.round(v)), 400)}
+              />
+            </div>
+            <div class="row">
+              {@render row("Minimum free disk space", "Stop and finalize continuous recordings before the clips drive falls below this reserve.")}
+              <SliderField
+                label="Minimum free disk space in GB"
+                min={1}
+                max={250}
+                step={1}
+                hardMin={1}
+                hardMax={1000}
+                defaultValue={5}
+                presets={[2, 5, 10, 20, 50, 100]}
+                value={s.continuous.min_free_gb}
+                format={(v) => `${v} GB`}
+                onchange={(v) => edit((d) => (d.continuous.min_free_gb = v), 350)}
+              />
+            </div>
+          </section>
+          <p class="foot">Leftover temporary recording files from an interrupted session are cleared automatically at startup. Right-click a folder row to copy its path or reset it.</p>
             {:else if tab === "appearance"}
           <h1>Appearance</h1>
           <section class="card">
@@ -1050,8 +1629,8 @@
               <Toggle on={s.badge_show_time} label="Show the timer" onchange={(v) => edit((d) => (d.badge_show_time = v))} />
             </div>
             <div class="row">
-              {@render row("Announce saved clips", "When a clip is saved, the badge briefly says so and shows its length, even if the label is off. While the badge is showing, the Windows notification is skipped.")}
-              <Toggle on={s.badge_clip_flash} label="Announce saved clips" onchange={(v) => edit((d) => (d.badge_clip_flash = v))} />
+              {@render row("Badge notifications", "Briefly flashes on the badge when a recording or clip is saved, split, paused, resumed or stopped, even if the label is off. While the badge is showing, the Windows notification is skipped.")}
+              <Toggle on={s.badge_clip_flash} label="Badge notifications" onchange={(v) => edit((d) => (d.badge_clip_flash = v))} />
             </div>
             <div class="row">
               {@render row("Colors", "Background, text, the recording dot and the replay dot.")}
@@ -1190,6 +1769,14 @@
     background: var(--accent);
     animation: pulse 2.4s var(--ease) infinite;
   }
+  .rec .dot {
+    background: #ef4444;
+    animation: pulse 1.6s var(--ease) infinite;
+  }
+  .paused .dot {
+    background: #f59e0b;
+    animation: none;
+  }
   .err .dot {
     background: var(--warn);
   }
@@ -1221,6 +1808,12 @@
   .on .meter span {
     background: var(--accent);
   }
+  .rec .meter span {
+    background: #ef4444;
+  }
+  .paused .meter span {
+    background: #f59e0b;
+  }
   .meter.big {
     height: 6px;
     margin-top: 18px;
@@ -1244,7 +1837,7 @@
   /* Stat tiles (Site Builder "stat tiles"). */
   .tiles {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 8px;
     margin-top: 14px;
   }
@@ -1840,6 +2433,13 @@
   .btn.primary:hover:not(:disabled) {
     background: var(--accent-strong);
   }
+  .btn.danger {
+    background: #ef4444;
+    color: #fff;
+  }
+  .btn.danger:hover:not(:disabled) {
+    background: #dc2626;
+  }
   .btn.ghost {
     background: transparent;
     color: var(--text-2);
@@ -2211,6 +2811,16 @@
     gap: 12px;
     margin: 0 0 14px;
   }
+  .mode-head {
+    align-items: center;
+    justify-content: space-between;
+  }
+  .p-title {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
   .p-head h2 {
     margin: 0;
     color: var(--text);
@@ -2355,5 +2965,180 @@
     flex: 1 1 0;
     min-width: 0;
     padding: 0 6px;
+  }
+
+  /* ---- Recording preview ---- */
+  .preview-tools {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+  }
+  .preview-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+      background var(--fast) var(--ease),
+      color var(--fast) var(--ease),
+      transform var(--med) var(--spring);
+  }
+  .preview-toggle:hover {
+    background: var(--surface-3);
+    color: var(--text);
+  }
+  .preview-toggle:active {
+    transform: scale(0.94);
+  }
+  .preview-toggle .dot {
+    width: 6px;
+    height: 6px;
+  }
+  .preview-toggle.on {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .preview-frame-box {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: 100%;
+    padding: 6px;
+    border-radius: 14px;
+    background: var(--surface-2);
+  }
+  .preview-stage {
+    position: relative;
+    width: min(100%, calc(220px * var(--ar, 1.777)));
+    max-height: 220px;
+    overflow: hidden;
+    border-radius: 9px;
+    background: #08090c;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .preview-img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  .preview-empty {
+    display: grid;
+    justify-items: center;
+    gap: 6px;
+    padding: 18px 20px;
+    text-align: center;
+    color: rgba(255, 255, 255, 0.72);
+    font-size: 12px;
+  }
+  .preview-empty b {
+    color: #fff;
+    font: 650 13px var(--font-display);
+  }
+  .preview-empty span {
+    max-width: 240px;
+    color: rgba(255, 255, 255, 0.56);
+    font-size: 11.5px;
+    line-height: 1.35;
+  }
+  .preview-pill {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 2;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: calc(100% - 16px);
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(12, 14, 18, 0.74);
+    backdrop-filter: blur(8px);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .preview-pill span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .preview-pill .dot {
+    width: 6px;
+    height: 6px;
+    background: rgba(255, 255, 255, 0.45);
+  }
+  .preview-pill.on .dot {
+    background: var(--accent);
+    animation: none;
+  }
+  .preview-pill.live .dot {
+    background: #30d158;
+  }
+  .preview-pill.warn .dot {
+    background: var(--warn);
+  }
+  .preview-badge {
+    position: absolute;
+    z-index: 2;
+    pointer-events: none;
+  }
+  .preview-badge.top-left {
+    top: 8px;
+    left: 8px;
+  }
+  .preview-badge.top-right {
+    top: 8px;
+    right: 8px;
+  }
+  .preview-badge.bottom-left {
+    bottom: 8px;
+    left: 8px;
+  }
+  .preview-badge.bottom-right {
+    bottom: 8px;
+    right: 8px;
+  }
+  .preview-mini {
+    font-size: calc(8px * min(var(--ms, 1), 1.4));
+  }
+  .preview-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .preview-chip {
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 11.5px;
+    font-weight: 550;
+    font-variant-numeric: tabular-nums;
+  }
+  .preview-note {
+    margin: 8px 2px 0;
+    color: var(--text-3);
+    font-size: 11.5px;
+    line-height: 1.4;
+  }
+  .preview-note.warn {
+    color: var(--warn);
   }
 </style>
