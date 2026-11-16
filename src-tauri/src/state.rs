@@ -284,6 +284,24 @@ impl AppState {
         });
     }
 
+    /// Instant feedback for a queued save/screenshot: the chime and a badge flash, before
+    /// the capture thread has even picked the request up.
+    fn acknowledge(&self, app: &AppHandle, kind: &'static str, label: &'static str) {
+        if self.settings().save_sound {
+            feedback::play_chime();
+        }
+        emit_badge_flash(
+            app,
+            BadgeFlash {
+                kind,
+                label,
+                secs: None,
+                tone: "ok",
+                duration_ms: 1200,
+            },
+        );
+    }
+
     /// Save the last `secs` seconds (`None` = whole buffer).
     pub fn save(&self, app: &AppHandle, secs: Option<u32>) {
         let queued = lock(&self.session)
@@ -291,7 +309,8 @@ impl AppState {
             .filter(|s| s.is_running())
             .map(|s| s.save(secs));
         match queued {
-            Some(true) => {}
+            // Acknowledge the key press now; the file is written a moment later.
+            Some(true) => self.acknowledge(app, "clip_saving", "SAVING CLIP"),
             Some(false) => feedback::notify(app, "Save skipped", "Saves are queued too quickly; try again."),
             None => feedback::notify(app, "Replay buffer is off", "Arm SuiCap from the tray to save clips."),
         }
@@ -304,7 +323,7 @@ impl AppState {
             .filter(|s| s.is_running())
             .map(|s| s.screenshot());
         match queued {
-            Some(true) => {}
+            Some(true) => self.acknowledge(app, "screenshot_saving", "SCREENSHOT"),
             Some(false) => feedback::notify(app, "Screenshot skipped", "Try again in a moment."),
             None => feedback::notify(
                 app,

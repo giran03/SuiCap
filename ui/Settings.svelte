@@ -54,11 +54,11 @@
   ];
 
   const resolutions = [
-    { w: 0, h: 0, label: "Monitor size" },
-    { w: 1280, h: 720, label: "1280 × 720", tag: "720p" },
-    { w: 1920, h: 1080, label: "1920 × 1080", tag: "1080p" },
-    { w: 2560, h: 1440, label: "2560 × 1440", tag: "1440p" },
-    { w: 3840, h: 2160, label: "3840 × 2160", tag: "4K" },
+    { w: 0, h: 0, tag: "Native", label: "Monitor size" },
+    { w: 1280, h: 720, tag: "720p", label: "1280 × 720" },
+    { w: 1920, h: 1080, tag: "1080p", label: "1920 × 1080" },
+    { w: 2560, h: 1440, tag: "1440p", label: "2560 × 1440" },
+    { w: 3840, h: 2160, tag: "4K", label: "3840 × 2160" },
   ];
 
   const armed = $derived(status?.phase === "armed");
@@ -206,18 +206,21 @@
     ...displays.map((d) => ({ value: d.number, label: d.label, badge: d.primary ? "Main" : undefined })),
   ]);
 
-  // Shortcuts: defaults mirror HotkeySettings::default in suicap-core/config.rs.
+  // Shortcuts: defaults mirror Hotkeys::default in suicap-core/config.rs.
   type HotkeyKey = keyof Settings["hotkeys"];
-  const hotkeyDefs: { key: HotkeyKey; label: string; def: string }[] = [
-    { key: "save_15", label: "Save last 15 seconds", def: "Ctrl+Alt+F9" },
-    { key: "save_30", label: "Save last 30 seconds", def: "Ctrl+Alt+F10" },
-    { key: "save_60", label: "Save last 60 seconds", def: "Ctrl+Alt+F11" },
-    { key: "save_full", label: "Save whole buffer", def: "Ctrl+Alt+F12" },
-    { key: "screenshot", label: "Take a screenshot", def: "Ctrl+Alt+F8" },
-    { key: "target_app", label: "Record the app in front", def: "Ctrl+Alt+F7" },
-    { key: "record_toggle", label: "Start or stop recording", def: "Ctrl+Alt+F6" },
-    { key: "record_pause", label: "Pause or resume recording", def: "" },
+  type HotkeyGroup = "Replay clips" | "Capture & recording" | "Screenshots";
+  const hotkeyDefs: { key: HotkeyKey; label: string; def: string; group: HotkeyGroup }[] = [
+    { key: "save_15", label: "Save last 15 seconds", def: "Ctrl+Alt+F9", group: "Replay clips" },
+    { key: "save_30", label: "Save last 30 seconds", def: "Ctrl+Alt+F10", group: "Replay clips" },
+    { key: "save_60", label: "Save last 60 seconds", def: "Ctrl+Alt+F11", group: "Replay clips" },
+    { key: "save_full", label: "Save whole buffer", def: "Ctrl+Alt+F12", group: "Replay clips" },
+    { key: "arm_toggle", label: "Turn replay on or off", def: "Ctrl+Alt+F4", group: "Capture & recording" },
+    { key: "record_toggle", label: "Start or stop recording", def: "Ctrl+Alt+F6", group: "Capture & recording" },
+    { key: "record_pause", label: "Pause or resume recording", def: "Ctrl+Alt+F5", group: "Capture & recording" },
+    { key: "target_app", label: "Record the app in front", def: "Ctrl+Alt+F7", group: "Capture & recording" },
+    { key: "screenshot", label: "Take a screenshot", def: "Ctrl+Alt+F8", group: "Screenshots" },
   ];
+  const hotkeyGroups: HotkeyGroup[] = ["Replay clips", "Capture & recording", "Screenshots"];
   const hotkeyRows = $derived(
     hotkeyDefs.map((h) => {
       const value = s.hotkeys[h.key];
@@ -864,13 +867,11 @@
                   <b>{fmtBytes(status.session_bytes)}</b>
                   <small>{status.segment_bytes > 0 ? `${fmtBytes(status.segment_bytes)} this part` : "Direct to disk"}</small>
                 </div>
-                <div class="tile-stat" class:bad={status.dropped > 0}><span>Dropped</span><b>{status.dropped}</b><small>frames</small></div>
               </div>
             {:else if armed && status}
               <div class="tiles">
                 <div class="tile-stat"><span>Buffered</span><b>{Math.min(status.buffered_secs, status.buffer_secs).toFixed(0)} s</b><small>of {status.buffer_secs} s</small></div>
                 <div class="tile-stat"><span>Memory</span><b>{status.buffered_mb.toFixed(0)} MB</b><small>in the buffer</small></div>
-                <div class="tile-stat" class:bad={status.dropped > 0}><span>Dropped</span><b>{status.dropped}</b><small>frames</small></div>
               </div>
             {:else}
               <div class="meter-legend">
@@ -1099,38 +1100,43 @@
               <button class="btn" disabled={hotkeyRows.every((r) => !r.changed)} onclick={resetAllHotkeys}>Reset all to default</button>
             </span>
           </div>
-          <section class="card">
-            {#each hotkeyRows as r (r.key)}
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div class="row" class:conflict={r.clash} oncontextmenu={(e) => hotkeyMenu(e, r)}>
-                <div class="row-text">
-                  <div class="row-title">{r.label}</div>
-                  <div class="row-desc">
-                    {#if r.clash}
-                      <span class="clash">Already used by “{r.clash}”. Pick another combination.</span>
-                    {:else if r.changed}
-                      Default: {r.def}
-                    {:else}
-                      Default shortcut
-                    {/if}
+          {#each hotkeyGroups as group (group)}
+            <div class="sc-group">
+              <h3 class="sc-group-title">{group}</h3>
+              <section class="card">
+                {#each hotkeyRows.filter((r) => r.group === group) as r (r.key)}
+                  <!-- svelte-ignore a11y_no_static_element_interactions -->
+                  <div class="row" class:conflict={r.clash} oncontextmenu={(e) => hotkeyMenu(e, r)}>
+                    <div class="row-text">
+                      <div class="row-title">{r.label}</div>
+                      <div class="row-desc">
+                        {#if r.clash}
+                          <span class="clash">Already used by “{r.clash}”. Pick another combination.</span>
+                        {:else if r.changed}
+                          Default: {r.def || "Not set"}
+                        {:else}
+                          Default shortcut
+                        {/if}
+                      </div>
+                    </div>
+                    <div class="sc-controls">
+                      {#if r.changed}
+                        <button class="icon-btn" title="Reset to {r.def || 'Not set'}" aria-label="Reset {r.label} to default" onclick={() => resetHotkey(r.key)} transition:scale={{ duration: 260, start: 0.6, easing: backOut }}>
+                          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" /></svg>
+                        </button>
+                      {/if}
+                      {#if r.value}
+                        <button class="icon-btn" title="Clear shortcut" aria-label="Clear {r.label}" onclick={() => edit((d) => (d.hotkeys[r.key] = ""))} transition:scale={{ duration: 260, start: 0.6, easing: backOut }}>
+                          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+                        </button>
+                      {/if}
+                      <HotkeyInput bind:this={hotkeyInputs[r.key]} value={r.value} onchange={(v) => edit((d) => (d.hotkeys[r.key] = v))} />
+                    </div>
                   </div>
-                </div>
-                <div class="sc-controls">
-                  {#if r.changed}
-                    <button class="icon-btn" title="Reset to {r.def}" aria-label="Reset {r.label} to default" onclick={() => resetHotkey(r.key)} transition:scale={{ duration: 260, start: 0.6, easing: backOut }}>
-                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" /></svg>
-                    </button>
-                  {/if}
-                  {#if r.value}
-                    <button class="icon-btn" title="Clear shortcut" aria-label="Clear {r.label}" onclick={() => edit((d) => (d.hotkeys[r.key] = ""))} transition:scale={{ duration: 260, start: 0.6, easing: backOut }}>
-                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
-                    </button>
-                  {/if}
-                  <HotkeyInput bind:this={hotkeyInputs[r.key]} value={r.value} onchange={(v) => edit((d) => (d.hotkeys[r.key] = v))} />
-                </div>
-              </div>
-            {/each}
-          </section>
+                {/each}
+              </section>
+            </div>
+          {/each}
           <p class="foot">Click a shortcut, then press the new keys. Backspace clears it, Escape keeps the old one.</p>
       </section>
 
@@ -1306,15 +1312,24 @@
             <section class="card" transition:slide={{ duration: 320, easing: cubicOut }}>
               <div class="row">
                 {@render row("Resolution", "Video is scaled on the GPU and letterboxed to keep its shape.")}
-                <Select
-                  label="Resolution"
-                  options={resolutions.map((r) => ({ value: `${r.w}x${r.h}`, label: r.label, tag: r.tag }))}
-                  value={`${s.custom.width}x${s.custom.height}`}
-                  onselect={(v) => {
-                    const [w, h] = v.split("x").map(Number);
-                    edit((d) => ((d.custom.width = w), (d.custom.height = h)));
-                  }}
-                />
+                <div class="res-group" role="radiogroup" aria-label="Resolution">
+                  {#each resolutions as r (`${r.w}x${r.h}`)}
+                    {@const active = s.custom.width === r.w && s.custom.height === r.h}
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      class="res-btn"
+                      class:current={active}
+                      onclick={() => edit((d) => ((d.custom.width = r.w), (d.custom.height = r.h)))}
+                    >
+                      <span class="res-tag">{r.tag}</span>
+                      <span class="res-full-wrap" aria-hidden={!active}>
+                        <span class="res-full">{r.label}</span>
+                      </span>
+                    </button>
+                  {/each}
+                </div>
               </div>
               <div class="row">
                 {@render row("Frame rate", "Capped at the monitor's refresh rate.")}
@@ -1837,9 +1852,77 @@
   /* Stat tiles (Site Builder "stat tiles"). */
   .tiles {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: 8px;
     margin-top: 14px;
+  }
+  .res-group {
+    display: flex;
+    flex-wrap: nowrap;
+    justify-content: space-between;
+    width: 100%;
+    box-sizing: border-box;
+    gap: 2px;
+    padding: 3px;
+    border-radius: var(--radius-md);
+    background: var(--surface-2);
+  }
+  .res-btn {
+    display: inline-flex;
+    align-items: center;
+    height: 28px;
+    padding: 0 7px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-3);
+    font: 550 12px var(--font);
+    cursor: pointer;
+    transition:
+      background var(--fast) var(--ease),
+      color var(--fast) var(--ease),
+      box-shadow var(--fast) var(--ease);
+  }
+  .res-btn:hover {
+    color: var(--text-2);
+  }
+  .res-btn.current {
+    background: var(--surface-3);
+    color: var(--text);
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.18);
+  }
+  .res-tag {
+    flex: none;
+    line-height: 1;
+  }
+  .res-btn.current .res-tag {
+    color: var(--accent);
+    font-weight: 650;
+  }
+  .res-full-wrap {
+    display: inline-grid;
+    align-items: center;
+    grid-template-columns: 0fr;
+    opacity: 0;
+    margin-left: 0;
+    transition:
+      grid-template-columns 260ms var(--spring),
+      opacity 180ms var(--ease),
+      margin-left 260ms var(--spring);
+  }
+  .res-btn.current .res-full-wrap {
+    grid-template-columns: 1fr;
+    opacity: 1;
+    margin-left: 5px;
+  }
+  .res-full {
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: 12px;
+    line-height: 1;
+    font-weight: 500;
+    color: var(--text-2);
+    font-variant-numeric: tabular-nums;
   }
   .tile-stat {
     display: grid;
@@ -2108,6 +2191,21 @@
     justify-content: space-between;
     gap: 12px;
     margin: 0 4px 10px;
+  }
+  .sc-group + .sc-group {
+    margin-top: 14px;
+  }
+  .sc-group-title {
+    margin: 0 4px 6px;
+    color: var(--text-3);
+    font: 650 11px var(--font);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .sc-group .card {
+    margin-top: 0;
+    border-radius: var(--radius-md);
+    background: var(--surface-2);
   }
   .sc-count {
     color: var(--text-3);
@@ -2784,7 +2882,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 380px;
+    grid-template-columns: minmax(0, 1fr) 416px;
     gap: 16px;
     align-items: stretch;
   }

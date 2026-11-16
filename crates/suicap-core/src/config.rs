@@ -214,7 +214,7 @@ pub const MEDIA_APPS: [&str; 6] = [
     "brave.exe",
     "opera.exe",
 ];
-const MAX_APPS: usize = 32;
+pub const MAX_APPS: usize = 32;
 /// Parked apps are not recorded, so the list may hold more than a track does.
 const MAX_IGNORED: usize = 64;
 const MAX_DISMISSED: usize = 128;
@@ -299,6 +299,8 @@ pub struct Hotkeys {
     pub record_toggle: String,
     /// Pause/resume an active continuous recording.
     pub record_pause: String,
+    /// Turn replay / capture on or off.
+    pub arm_toggle: String,
 }
 
 impl Default for Hotkeys {
@@ -311,14 +313,15 @@ impl Default for Hotkeys {
             screenshot: "Ctrl+Alt+F8".into(),
             target_app: "Ctrl+Alt+F7".into(),
             record_toggle: "Ctrl+Alt+F6".into(),
-            record_pause: String::new(),
+            record_pause: "Ctrl+Alt+F5".into(),
+            arm_toggle: "Ctrl+Alt+F4".into(),
         }
     }
 }
 
 impl Hotkeys {
     /// Every accelerator, for validation.
-    pub fn all(&self) -> [&str; 8] {
+    pub fn all(&self) -> [&str; 9] {
         [
             &self.save_15,
             &self.save_30,
@@ -328,6 +331,7 @@ impl Hotkeys {
             &self.target_app,
             &self.record_toggle,
             &self.record_pause,
+            &self.arm_toggle,
         ]
     }
 
@@ -885,6 +889,7 @@ mod tests {
         assert!(bad(|s| s.hotkeys.save_15 = "ctrl+alt+f10".into())); // duplicate of save_30
         assert!(bad(|s| s.hotkeys.record_toggle = "ctrl+alt+f9".into())); // duplicate of save_15
         assert!(bad(|s| s.hotkeys.record_pause = "ctrl+alt+f6".into())); // duplicate of record_toggle
+        assert!(bad(|s| s.hotkeys.arm_toggle = "ctrl+alt+f8".into())); // duplicate of screenshot
         let mut s = Settings {
             mode: RecordingMode::Continuous,
             continuous: ContinuousSettings {

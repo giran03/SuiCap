@@ -1,9 +1,9 @@
-//! Parks a program by itself once it is playing sound and is on no list.
+//! Parks a program by itself once it is playing sound and is on no list, and adds any
+//! detected game (and any program on the baked-in known-games list) to the Game audio track.
 //!
-//! Runs in the background (the settings window need not be open). The app goes to
-//! "Not recorded", so nothing is captured that the user did not choose (they drag it to a track
-//! to record it). Listed and forgotten apps are left alone, and so is the detected game, which
-//! the Game track follows by itself, and SuiCap itself.
+//! Runs in the background (the settings window need not be open). Listed and forgotten apps
+//! are left alone, and SuiCap itself is never added. Non-game apps go to "Not recorded",
+//! while the detected game goes directly to the Game track.
 
 use std::time::Duration;
 use suicap_core::config::{AudioSettings, Settings};
@@ -46,17 +46,31 @@ fn listed(a: &AudioSettings, exe: &str) -> bool {
         .any(|l| l.iter().any(|n| n.eq_ignore_ascii_case(exe)))
 }
 
-/// `s` with every new playing app placed on a track; `None` when there is nothing to add.
+/// `s` with the detected game added to `game` and every new playing app parked under `ignored`;
+/// `None` when there is nothing to add.
 pub fn with_new_apps(s: &Settings, playing: &[String], game: Option<&str>) -> Option<Settings> {
     let mut next = s.clone();
     let mut changed = false;
+    if let Some(g) = game
+        && valid(g)
+        && !listed(&next.audio, g)
+        && next.audio.game.len() < suicap_core::config::MAX_APPS
+    {
+        next.audio.game.push(g.to_owned());
+        changed = true;
+    }
     for exe in playing {
         let a = &mut next.audio;
         if listed(a, exe) || !valid(exe) {
             continue;
         }
-        if game.is_some_and(|g| g.eq_ignore_ascii_case(exe)) {
-            continue; // the Game track follows the detected game itself; never silence it
+        // A known game goes to the Game track; anything else is parked by itself.
+        if suicap_core::game_exes::is_game_exe(exe) {
+            if a.game.len() < suicap_core::config::MAX_APPS {
+                a.game.push(exe.clone());
+                changed = true;
+            }
+            continue;
         }
         if a.ignored.len() >= MAX_PARKED {
             continue;
@@ -90,6 +104,20 @@ mod tests {
     }
 
     #[test]
+    fn a_known_game_playing_sound_goes_to_game_unless_the_user_moved_it() {
+        let s = Settings::default();
+        let n = with_new_apps(&s, &playing(&["Overwatch.exe"]), None).unwrap();
+        assert_eq!(n.audio.game, ["Overwatch.exe"]);
+        assert!(!n.audio.ignored.iter().any(|m| m == "Overwatch.exe"));
+        let mut moved = Settings::default();
+        moved.audio.media.push("overwatch.exe".into());
+        assert!(with_new_apps(&moved, &playing(&["Overwatch.exe"]), None).is_none());
+        let mut forgotten = Settings::default();
+        forgotten.audio.ignored.push("overwatch.exe".into());
+        assert!(with_new_apps(&forgotten, &playing(&["Overwatch.exe"]), None).is_none());
+    }
+
+    #[test]
     fn listed_parked_and_forgotten_apps_are_left_alone() {
         let mut s = Settings::default();
         s.audio.ignored.push("a.exe".into());
@@ -98,8 +126,17 @@ mod tests {
     }
 
     #[test]
-    fn the_detected_game_is_never_parked() {
+    fn the_detected_game_is_added_to_game_track() {
         let s = Settings::default();
+        let n = with_new_apps(&s, &playing(&["halo.exe"]), Some("HALO.exe")).unwrap();
+        assert_eq!(n.audio.game, ["HALO.exe"]);
+        assert_eq!(n.audio.ignored, s.audio.ignored);
+    }
+
+    #[test]
+    fn dismissed_or_listed_game_is_not_readded() {
+        let mut s = Settings::default();
+        s.audio.dismissed.push("halo.exe".into());
         assert!(with_new_apps(&s, &playing(&["halo.exe"]), Some("HALO.exe")).is_none());
     }
 }

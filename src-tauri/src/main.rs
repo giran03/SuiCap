@@ -51,6 +51,11 @@ fn is_record_pause_key(app: &AppHandle, shortcut: &Shortcut) -> bool {
     !key.is_empty() && Shortcut::from_str(&key).is_ok_and(|s| s == *shortcut)
 }
 
+fn is_arm_toggle_key(app: &AppHandle, shortcut: &Shortcut) -> bool {
+    let key = app.state::<AppState>().settings().hotkeys.arm_toggle;
+    !key.is_empty() && Shortcut::from_str(&key).is_ok_and(|s| s == *shortcut)
+}
+
 /// (Re)register the save shortcuts; failures (a key taken by another app) are shown
 /// in the settings window.
 pub fn register_hotkeys(app: &AppHandle) {
@@ -127,6 +132,16 @@ fn main() {
                         });
                     } else if is_record_pause_key(app, shortcut) {
                         let _ = app.state::<AppState>().record_pause();
+                    } else if is_arm_toggle_key(app, shortcut) {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let st = app.state::<AppState>();
+                            if st.is_armed() {
+                                st.disarm(&app);
+                            } else {
+                                st.arm(&app);
+                            }
+                        });
                     }
                 })
                 .build(),

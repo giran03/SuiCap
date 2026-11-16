@@ -433,7 +433,7 @@
   <div class="m-row">
     <div class="m-text">
       <div class="m-title">Add apps automatically</div>
-      <div class="m-desc">An app that plays sound and is on no list is parked under Not recorded by itself, so nothing is captured you did not choose. Drag it to a track to record it.</div>
+      <div class="m-desc">Detected games are added to Game automatically; other apps that play sound and are on no list are parked under Not recorded. Drag any app to move it.</div>
     </div>
     <Toggle on={s.audio.auto_add} label="Add apps automatically" onchange={(v) => edit((d) => (d.audio.auto_add = v))} />
   </div>

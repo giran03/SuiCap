@@ -82,6 +82,7 @@ export interface Settings {
     target_app: string;
     record_toggle: string;
     record_pause: string;
+    arm_toggle: string;
   };
   save_sound: boolean;
   save_toast: boolean;

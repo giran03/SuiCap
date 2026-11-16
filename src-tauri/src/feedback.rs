@@ -93,14 +93,13 @@ pub fn media_saved(
 
 /// `toast_ok` is false when the badge already announced the clip.
 pub fn clip_saved(app: &AppHandle, settings: &Settings, name: &str, secs: f64, toast_ok: bool) {
-    media_saved(app, settings, "Clip saved", name, secs, true, toast_ok);
+    // The chime already played when the save was requested (`AppState::acknowledge`).
+    media_saved(app, settings, "Clip saved", name, secs, false, toast_ok);
 }
 
 /// `toast_ok` is false when the badge already announced the screenshot.
 pub fn screenshot_saved(app: &AppHandle, settings: &Settings, name: &str, toast_ok: bool) {
-    if settings.save_sound {
-        play_chime();
-    }
+    // The chime already played when the screenshot was requested.
     if settings.save_toast && toast_ok {
         notify(app, "Screenshot saved", name);
     }

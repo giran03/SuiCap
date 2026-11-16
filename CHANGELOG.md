@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.1.3 (in development)
+## 0.1.3 (2026-11-16)
+
+### Changed
+- **Automatic Game audio routing**: Detected games are now added automatically to the **Game** audio track by default (while other unlisted apps playing sound continue to be parked under **Not recorded**).
+- **Instant clip & screenshot feedback**: Saving a clip or taking a screenshot now plays the chime and flashes the recording badge immediately when triggered, before writing the file finishes.
 
 ## 0.1.2 (2026-11-15)
 
